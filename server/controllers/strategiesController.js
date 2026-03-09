@@ -2448,12 +2448,18 @@ exports.createPolymarketCopyTrader = async (req, res) => {
 
 exports.getPolymarketBalanceAllowance = async (req, res) => {
   try {
-    const { userId } = req.params;
-    const userKey = String(userId || '');
-    if (!userKey || req.user !== userKey) {
-      return res.status(403).json({
+    const requestedUserId = String(req.params.userId || '').trim();
+    const userId = String(req.user || '').trim();
+    if (!userId) {
+      return res.status(401).json({
         status: 'fail',
-        message: "Credentials couldn't be validated.",
+        message: 'Authorization denied, user is not logged in.',
+      });
+    }
+    if (requestedUserId && requestedUserId !== userId) {
+      console.warn('[PolymarketBalance] Ignoring mismatched userId param', {
+        requestedUserId,
+        tokenUserId: userId,
       });
     }
 
@@ -2490,12 +2496,19 @@ exports.getPolymarketBalanceAllowance = async (req, res) => {
 
 exports.getStrategyLogs = async (req, res) => {
   try {
-    const { userId, strategyId } = req.params;
-
-    if (req.user !== userId) {
-      return res.status(403).json({
+    const { strategyId } = req.params;
+    const requestedUserId = String(req.params.userId || '').trim();
+    const userId = String(req.user || '').trim();
+    if (!userId) {
+      return res.status(401).json({
         status: 'fail',
-        message: 'Credentials could not be validated.',
+        message: 'Authorization denied, user is not logged in.',
+      });
+    }
+    if (requestedUserId && requestedUserId !== userId) {
+      console.warn('[StrategyLogs] Ignoring mismatched userId param', {
+        requestedUserId,
+        tokenUserId: userId,
       });
     }
 
@@ -2522,12 +2535,18 @@ exports.getStrategyLogs = async (req, res) => {
 
 exports.getAllStrategyLogs = async (req, res) => {
   try {
-    const { userId } = req.params;
-
-    if (req.user !== userId) {
-      return res.status(403).json({
+    const requestedUserId = String(req.params.userId || '').trim();
+    const userId = String(req.user || '').trim();
+    if (!userId) {
+      return res.status(401).json({
         status: 'fail',
-        message: 'Credentials could not be validated.',
+        message: 'Authorization denied, user is not logged in.',
+      });
+    }
+    if (requestedUserId && requestedUserId !== userId) {
+      console.warn('[StrategyLogsAll] Ignoring mismatched userId param', {
+        requestedUserId,
+        tokenUserId: userId,
       });
     }
 
@@ -2621,7 +2640,9 @@ exports.getAllStrategyLogs = async (req, res) => {
 
 exports.getStrategyEquityHistory = async (req, res) => {
   try {
-    const { userId, strategyId } = req.params;
+    const { strategyId } = req.params;
+    const requestedUserId = String(req.params.userId || '').trim();
+    const userId = String(req.user || '').trim();
     if (!userId || !strategyId) {
       return res.status(400).json({
         status: 'fail',
@@ -2629,10 +2650,10 @@ exports.getStrategyEquityHistory = async (req, res) => {
       });
     }
 
-    if (req.user !== userId) {
-      return res.status(403).json({
-        status: 'fail',
-        message: 'Credentials could not be validated.',
+    if (requestedUserId && requestedUserId !== userId) {
+      console.warn('[EquityHistory] Ignoring mismatched userId param', {
+        requestedUserId,
+        tokenUserId: userId,
       });
     }
 
@@ -2683,11 +2704,18 @@ exports.getStrategyEquityHistory = async (req, res) => {
 
 exports.getEquityBackfillStatus = async (req, res) => {
   try {
-    const { userId } = req.params;
-    if (req.user !== userId) {
-      return res.status(403).json({
+    const requestedUserId = String(req.params.userId || '').trim();
+    const userId = String(req.user || '').trim();
+    if (!userId) {
+      return res.status(401).json({
         status: 'fail',
-        message: 'Credentials could not be validated.',
+        message: 'Authorization denied, user is not logged in.',
+      });
+    }
+    if (requestedUserId && requestedUserId !== userId) {
+      console.warn('[EquityBackfillStatus] Ignoring mismatched userId param', {
+        requestedUserId,
+        tokenUserId: userId,
       });
     }
     const task = await MaintenanceTask.findOne({ taskName: EQUITY_BACKFILL_TASK }).lean();
@@ -2713,11 +2741,18 @@ exports.getEquityBackfillStatus = async (req, res) => {
 
 exports.triggerEquityBackfill = async (req, res) => {
   try {
-    const { userId } = req.params;
-    if (req.user !== userId) {
-      return res.status(403).json({
+    const requestedUserId = String(req.params.userId || '').trim();
+    const userId = String(req.user || '').trim();
+    if (!userId) {
+      return res.status(401).json({
         status: 'fail',
-        message: 'Credentials could not be validated.',
+        message: 'Authorization denied, user is not logged in.',
+      });
+    }
+    if (requestedUserId && requestedUserId !== userId) {
+      console.warn('[EquityBackfill] Ignoring mismatched userId param', {
+        requestedUserId,
+        tokenUserId: userId,
       });
     }
 
@@ -4155,20 +4190,21 @@ exports.rebalanceNow = async (req, res) => {
 
 exports.getPortfolios = async (req, res) => {
   try {
-    const { userId } = req.params;
-    const userKey = String(userId || '');
+    const requestedUserId = String(req.params.userId || '').trim();
+    const userId = String(req.user || '').trim();
+    const userKey = userId;
 
     if (!userId) {
-      return res.status(400).json({
+      return res.status(401).json({
         status: 'fail',
-        message: 'User ID is required',
+        message: 'Authorization denied, user is not logged in.',
       });
     }
 
-    if (!userKey || req.user !== userKey) {
-      return res.status(403).json({
-        status: 'fail',
-        message: "Credentials couldn't be validated.",
+    if (requestedUserId && requestedUserId !== userId) {
+      console.warn('[Portfolios] Ignoring mismatched userId param', {
+        requestedUserId,
+        tokenUserId: userId,
       });
     }
 
@@ -5217,11 +5253,18 @@ exports.resendCollaborativeOrders = async (req, res) => {
 };
 exports.getStrategies = async (req, res) => {
   try {
-    const userId = String(req.params.userId || '');
-    if (!userId || req.user !== userId) {
-      return res.status(403).json({
-        status: "fail",
-        message: "Credentials couldn't be validated.",
+    const requestedUserId = String(req.params.userId || '').trim();
+    const userId = String(req.user || '').trim();
+    if (!userId) {
+      return res.status(401).json({
+        status: 'fail',
+        message: 'Authorization denied, user is not logged in.',
+      });
+    }
+    if (requestedUserId && requestedUserId !== userId) {
+      console.warn('[Strategies] Ignoring mismatched userId param', {
+        requestedUserId,
+        tokenUserId: userId,
       });
     }
 
@@ -5268,11 +5311,18 @@ exports.getStrategies = async (req, res) => {
 
 exports.getStrategyTemplates = async (req, res) => {
   try {
-    const userId = String(req.params.userId || '');
-    if (!userId || req.user !== userId) {
-      return res.status(403).json({
+    const requestedUserId = String(req.params.userId || '').trim();
+    const userId = String(req.user || '').trim();
+    if (!userId) {
+      return res.status(401).json({
         status: 'fail',
-        message: "Credentials couldn't be validated.",
+        message: 'Authorization denied, user is not logged in.',
+      });
+    }
+    if (requestedUserId && requestedUserId !== userId) {
+      console.warn('[StrategyTemplates] Ignoring mismatched userId param', {
+        requestedUserId,
+        tokenUserId: userId,
       });
     }
 
