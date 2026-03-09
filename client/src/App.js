@@ -29,7 +29,35 @@ const StrategyLogsRoute = () => {
 
 
 function App() {
-  const loadStoredUser = () => {
+  const decodeJwtPayload = (token) => {
+    try {
+      if (!token || typeof token !== "string") {
+        return null;
+      }
+      const parts = token.split(".");
+      if (parts.length !== 3) {
+        return null;
+      }
+      const payload = parts[1];
+      const normalized = payload.replace(/-/g, "+").replace(/_/g, "/");
+      const padded = normalized.padEnd(normalized.length + ((4 - (normalized.length % 4)) % 4), "=");
+      const base64Decode = (value) => {
+        if (typeof window !== "undefined" && typeof window.atob === "function") {
+          return window.atob(value);
+        }
+        return null;
+      };
+      const decoded = base64Decode(padded);
+      if (!decoded) {
+        return null;
+      }
+      return JSON.parse(decoded);
+    } catch {
+      return null;
+    }
+  };
+
+  const loadStoredUser = (token) => {
     try {
       const raw = localStorage.getItem("user");
       if (!raw) {
@@ -37,6 +65,13 @@ function App() {
       }
       const parsed = JSON.parse(raw);
       if (!parsed || typeof parsed !== "object") {
+        return undefined;
+      }
+      const payload = decodeJwtPayload(token);
+      const tokenUserId = payload?.id ? String(payload.id) : null;
+      const storedUserId = parsed?.id ? String(parsed.id) : null;
+      if (tokenUserId && storedUserId && tokenUserId !== storedUserId) {
+        localStorage.removeItem("user");
         return undefined;
       }
       // Never persist secrets in localStorage.
@@ -50,9 +85,10 @@ function App() {
     }
   };
 
+  const storedToken = localStorage.getItem("auth-token") || undefined;
   const [userData, setUserData] = useState({
-    token: localStorage.getItem("auth-token") || undefined,
-    user: loadStoredUser(),
+    token: storedToken,
+    user: loadStoredUser(storedToken),
     ALPACA_API_KEY_ID: undefined,
     ALPACA_API_SECRET_KEY: undefined,
   });
@@ -94,6 +130,7 @@ function App() {
         localStorage.setItem("user", JSON.stringify(userRes.data));
       } else {
         localStorage.removeItem("user");
+        localStorage.setItem("auth-token", "");
         setUserData({ token: undefined, user: undefined, ALPACA_API_KEY_ID: undefined, ALPACA_API_SECRET_KEY: undefined });
       }
     };

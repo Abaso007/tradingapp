@@ -4205,7 +4205,7 @@ exports.getPortfolios = async (req, res) => {
       Math.floor(Number(process.env.ALPACA_LATEST_TRADES_BATCH_SIZE || 200))
     );
 
-    const needsLiveSnapshot = rawPortfolios.some((portfolio) => {
+    const needsLiveSnapshot = envAlpacaExecutionMode === 'live' && rawPortfolios.some((portfolio) => {
       const provider = String(portfolio?.provider || 'alpaca');
       if (provider === 'polymarket') {
         return false;
@@ -4218,6 +4218,9 @@ exports.getPortfolios = async (req, res) => {
       const provider = String(portfolio?.provider || 'alpaca');
       if (provider === 'polymarket') {
         return false;
+      }
+      if (envAlpacaExecutionMode !== 'live') {
+        return true;
       }
       const requested = normalizeAlpacaExecutionModeOverride(portfolio?.alpaca?.executionMode) || 'paper';
       return requested !== 'live';
@@ -4281,9 +4284,14 @@ exports.getPortfolios = async (req, res) => {
       }
     };
 
+    const [paperSnapshot, liveSnapshot] = await Promise.all([
+      needsPaperSnapshot ? fetchSnapshot('paper') : Promise.resolve(null),
+      needsLiveSnapshot ? fetchSnapshot('live') : Promise.resolve(null),
+    ]);
+
     const snapshots = {
-      paper: needsPaperSnapshot ? await fetchSnapshot('paper') : null,
-      live: needsLiveSnapshot ? await fetchSnapshot('live') : null,
+      paper: paperSnapshot,
+      live: liveSnapshot,
     };
 
     const cashByMode = {
@@ -4423,7 +4431,18 @@ exports.getPortfolios = async (req, res) => {
       const alpacaRequestedExecutionMode = provider === 'polymarket'
         ? null
         : (normalizeAlpacaExecutionModeOverride(portfolio?.alpaca?.executionMode) || 'paper');
-      const alpacaSnapshot = alpacaRequestedExecutionMode === 'live' ? snapshots.live : snapshots.paper;
+      const alpacaEffectiveExecutionMode =
+        provider === 'polymarket'
+          ? null
+          : envAlpacaExecutionMode === 'live'
+            ? alpacaRequestedExecutionMode
+            : 'paper';
+      const alpacaSnapshot =
+        provider === 'polymarket'
+          ? null
+          : alpacaEffectiveExecutionMode === 'live'
+            ? snapshots.live
+            : snapshots.paper;
       const positionMapForMode = alpacaSnapshot?.positionMap || {};
       let normalizedTargets = normalizeTargetPositions(portfolio.targetPositions || []);
       if (!normalizedTargets.length) {
@@ -4569,13 +4588,6 @@ exports.getPortfolios = async (req, res) => {
         provider === 'polymarket' && portfolio?.polymarket?.sizingState && typeof portfolio.polymarket.sizingState === 'object'
           ? portfolio.polymarket.sizingState
           : {};
-
-      const alpacaEffectiveExecutionMode =
-        provider === 'polymarket'
-          ? null
-          : envAlpacaExecutionMode === 'live'
-            ? alpacaRequestedExecutionMode
-            : 'paper';
 
       return {
         provider,
