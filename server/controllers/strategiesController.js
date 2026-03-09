@@ -4194,6 +4194,16 @@ exports.getPortfolios = async (req, res) => {
     }
 
     const envAlpacaExecutionMode = getEnvAlpacaExecutionMode();
+    const snapshotTimeoutMs = Number(
+      process.env.ALPACA_PORTFOLIOS_SNAPSHOT_TIMEOUT_MS ||
+        process.env.ALPACA_ACCOUNT_TIMEOUT_MS ||
+        5000
+    );
+    const priceTimeoutMs = Number(process.env.ALPACA_PORTFOLIOS_PRICE_TIMEOUT_MS || snapshotTimeoutMs);
+    const latestTradesBatchSize = Math.max(
+      1,
+      Math.floor(Number(process.env.ALPACA_LATEST_TRADES_BATCH_SIZE || 200))
+    );
 
     const needsLiveSnapshot = rawPortfolios.some((portfolio) => {
       const provider = String(portfolio?.provider || 'alpaca');
@@ -4225,12 +4235,14 @@ exports.getPortfolios = async (req, res) => {
 
         const [positionsResponse, accountResponse] = await Promise.all([
           tradingKeys.client.get(`${tradingKeys.apiUrl}/v2/positions`, {
+            timeout: snapshotTimeoutMs,
             headers: {
               'APCA-API-KEY-ID': tradingKeys.keyId,
               'APCA-API-SECRET-KEY': tradingKeys.secretKey,
             },
           }),
           tradingKeys.client.get(`${tradingKeys.apiUrl}/v2/account`, {
+            timeout: snapshotTimeoutMs,
             headers: {
               'APCA-API-KEY-ID': tradingKeys.keyId,
               'APCA-API-SECRET-KEY': tradingKeys.secretKey,
@@ -4312,21 +4324,63 @@ exports.getPortfolios = async (req, res) => {
         'APCA-API-KEY-ID': dataKeys.keyId,
         'APCA-API-SECRET-KEY': dataKeys.secretKey,
       };
-      await Promise.all(
-        Array.from(symbolsToFetch).map(async (symbol) => {
-          try {
-            const { data } = await dataKeys.client.get(`${dataKeys.apiUrl}/v2/stocks/${symbol}/trades/latest`, {
-              headers,
-            });
-            const price = toNumber(data?.trade?.p, null);
-            if (price) {
-              combinedPriceCache[symbol] = price;
-            }
-          } catch (error) {
-            console.warn(`[Portfolios] Failed to fetch latest price for ${symbol}: ${error.message}`);
+      const symbols = Array.from(symbolsToFetch);
+      let batchSupported = true;
+
+      const fetchLatestTradesBatch = async (symbolChunk) => {
+        const { data } = await dataKeys.client.get(`${dataKeys.apiUrl}/v2/stocks/trades/latest`, {
+          headers,
+          params: { symbols: symbolChunk.join(',') },
+          timeout: priceTimeoutMs,
+        });
+        const trades = data?.trades;
+        if (!trades || typeof trades !== 'object') {
+          throw new Error('Unexpected latest trades batch response');
+        }
+
+        symbolChunk.forEach((symbol) => {
+          const trade = trades?.[symbol];
+          const price = toNumber(trade?.p, null);
+          if (price) {
+            combinedPriceCache[symbol] = price;
           }
-        })
-      );
+        });
+      };
+
+      const fetchLatestTradesPerSymbol = async (symbolChunk) => {
+        await Promise.all(
+          symbolChunk.map(async (symbol) => {
+            try {
+              const { data } = await dataKeys.client.get(`${dataKeys.apiUrl}/v2/stocks/${symbol}/trades/latest`, {
+                headers,
+                timeout: priceTimeoutMs,
+              });
+              const price = toNumber(data?.trade?.p, null);
+              if (price) {
+                combinedPriceCache[symbol] = price;
+              }
+            } catch (error) {
+              console.warn(`[Portfolios] Failed to fetch latest price for ${symbol}: ${error.message}`);
+            }
+          })
+        );
+      };
+
+      for (let idx = 0; idx < symbols.length; idx += latestTradesBatchSize) {
+        const chunk = symbols.slice(idx, idx + latestTradesBatchSize);
+        if (batchSupported) {
+          try {
+            await fetchLatestTradesBatch(chunk);
+            continue;
+          } catch (error) {
+            if (error?.response?.status === 404) {
+              batchSupported = false;
+            }
+          }
+        }
+
+        await fetchLatestTradesPerSymbol(chunk);
+      }
     }
 
     const now = new Date();

@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from "react";
+import React, { useState, useEffect, useCallback } from "react";
 import Axios from "axios";
 import config from "../../config/Config";
 import styles from "../Template/PageTemplate.module.css";
@@ -27,11 +27,13 @@ const FixedHeightPaper = styled(StyledPaper)({
 
 const Dashboard = ({ userData, setUserData, onViewStrategyLogs }) => {
   const [purchasedStocks, setPurchasedStocks] = useState([]);
-  const [accountBalance, setAccountBalance] = useState([]);
+  const [accountBalance, setAccountBalance] = useState(0);
   const [orderList, setOrderList] = useState({ orders: [], positions: [] });
   const [ordersLoading, setOrdersLoading] = useState(false);
   const [ordersError, setOrdersError] = useState(null);
   const [portfolios, setPortfolios] = useState([]);
+  const userId = userData?.user?.id;
+  const token = userData?.token;
   const polymarketVirtualFunds = (portfolios || []).reduce((sum, portfolio) => {
     if (portfolio?.provider !== "polymarket") {
       return sum;
@@ -41,12 +43,17 @@ const Dashboard = ({ userData, setUserData, onViewStrategyLogs }) => {
   }, 0);
 
   // Function to get the list of purchased stocks from the server using Alpacas API
-  const getPurchasedStocks = async () => {
+  const getPurchasedStocks = useCallback(async () => {
     try {
-      logDebug('Fetching stocks for user:', userData.user.id);
-      const url = config.base_url + `/api/stock/${userData.user.id}`;
+      if (!token || !userId) {
+        setPurchasedStocks([]);
+        setAccountBalance(0);
+        return;
+      }
+      logDebug('Fetching stocks for user:', userId);
+      const url = config.base_url + `/api/stock/${userId}`;
       const headers = {
-        "x-auth-token": userData.token,
+        "x-auth-token": token,
       };
 
       const response = await Axios.get(url, { headers });
@@ -65,17 +72,22 @@ const Dashboard = ({ userData, setUserData, onViewStrategyLogs }) => {
       setPurchasedStocks([]);
       setAccountBalance(0);
     }
-  };
+  }, [token, userId]);
 
   // Function to get the list of orders from the server using Alpacas API
-  const getOrderList = async () => {
+  const getOrderList = useCallback(async () => {
     try {
+      if (!token || !userId) {
+        setOrderList({ orders: [], positions: [] });
+        setOrdersError(null);
+        return;
+      }
       setOrdersLoading(true);
       setOrdersError(null);
-      logDebug('Fetching orders for user:', userData.user.id);
-      const url = config.base_url + `/api/order/${userData.user.id}`;
+      logDebug('Fetching orders for user:', userId);
+      const url = config.base_url + `/api/order/${userId}`;
       const headers = {
-        "x-auth-token": userData.token,
+        "x-auth-token": token,
       };
 
       const response = await Axios.get(url, { headers });
@@ -100,14 +112,18 @@ const Dashboard = ({ userData, setUserData, onViewStrategyLogs }) => {
     } finally {
       setOrdersLoading(false);
     }
-  };
+  }, [token, userId]);
 
   // Function to get the Strategy Portfolios from the server using MangoDB
-  const getPortfolio = async () => {
+  const getPortfolio = useCallback(async () => {
     try {
-      const url = config.base_url + `/api/strategies/portfolios/${userData.user.id}`;
+      if (!token || !userId) {
+        setPortfolios([]);
+        return;
+      }
+      const url = config.base_url + `/api/strategies/portfolios/${userId}`;
       const headers = {
-        "x-auth-token": userData.token,
+        "x-auth-token": token,
       };
   
       const response = await Axios.get(url, { headers });
@@ -115,17 +131,19 @@ const Dashboard = ({ userData, setUserData, onViewStrategyLogs }) => {
       if (response.data.status === "success") {
         setPortfolios(response.data.portfolios);
         logDebug("Portfolios ", response.data.portfolios);
+      } else {
+        setPortfolios([]);
       }
     } catch (error) {
       logError('Error fetching portfolios:', error);
     }
-  };
+  }, [token, userId]);
 
   useEffect(() => {
     getPurchasedStocks();
     getOrderList();
     getPortfolio();
-  }, []);
+  }, [getPurchasedStocks, getOrderList, getPortfolio]);
 
   return (
     <Container maxWidth="lg" className={styles.container}>

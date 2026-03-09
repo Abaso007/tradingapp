@@ -1,4 +1,4 @@
-import React, { useContext, useState, useEffect } from "react";
+import React, { useContext, useState, useEffect, useCallback } from "react";
 import { useNavigate, useLocation } from "react-router-dom";
 import UserContext from "../../context/UserContext";
 import styles from "./PageTemplate.module.css";
@@ -86,21 +86,29 @@ const PageTemplate = ({ initialPage = "dashboard", initialStrategyId = null, ini
   const [currentPage, setCurrentPage] = useState(initialPage || "dashboard");
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [purchasedStocks, setPurchasedStocks] = useState([]);
-  const [accountBalance, setAccountBalance] = useState([]);
+  const [accountBalance, setAccountBalance] = useState(0);
   const [selectedStrategyForLogs, setSelectedStrategyForLogs] = useState({
     id: initialStrategyId,
     name: initialStrategyName,
   });
   const isStrategyLogsRoute = /^\/strategies\/[^/]+\/logs/.test(location.pathname);
   const isLiveLogsRoute = /^\/logs/.test(location.pathname);
+  const userId = userData?.user?.id;
+  const token = userData?.token;
 
 
 
   //Function to get the list of purchased stocks from the server using Alpacas API
-  const getPurchasedStocks = async () => {
-    const url = config.base_url + `/api/stock/${userData.user.id}`;
+  const getPurchasedStocks = useCallback(async () => {
+    if (!token || !userId) {
+      setPurchasedStocks([]);
+      setAccountBalance(0);
+      return;
+    }
+
+    const url = config.base_url + `/api/stock/${userId}`;
     const headers = {
-      "x-auth-token": userData.token,
+      "x-auth-token": token,
     };
 
     const response = await Axios.get(url, {
@@ -112,12 +120,12 @@ const PageTemplate = ({ initialPage = "dashboard", initialStrategyId = null, ini
       // console.log("response.data.stocks ", response.data.stocks);
       setAccountBalance(response.data.cash);
     }
-  };
+  }, [token, userId]);
 
 
   useEffect(() => {
     getPurchasedStocks();
-  }, []);
+  }, [getPurchasedStocks]);
 
   useEffect(() => {
     setSelectedStrategyForLogs({
@@ -161,6 +169,7 @@ const PageTemplate = ({ initialPage = "dashboard", initialStrategyId = null, ini
       user: undefined,
     });
     localStorage.setItem("auth-token", "");
+    localStorage.removeItem("user");
     navigate("/login");
   };
 

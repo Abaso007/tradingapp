@@ -783,10 +783,146 @@ const isWeekendDateKey = (dateKey) => {
   return dow === 0 || dow === 6;
 };
 
+const US_MARKET_HOLIDAYS_CACHE = new Map();
+
+const buildDateKeyUtc = (year, monthIndex, day) => {
+  if (!Number.isFinite(year) || !Number.isFinite(monthIndex) || !Number.isFinite(day)) {
+    return null;
+  }
+  const date = new Date(Date.UTC(year, monthIndex, day));
+  if (Number.isNaN(date.getTime())) {
+    return null;
+  }
+  return toISODateKey(date);
+};
+
+const getNthWeekdayOfMonthUtc = (year, monthIndex, weekday, occurrence) => {
+  const firstOfMonth = new Date(Date.UTC(year, monthIndex, 1));
+  if (Number.isNaN(firstOfMonth.getTime())) {
+    return null;
+  }
+  const firstWeekday = firstOfMonth.getUTCDay();
+  const offset = (7 + weekday - firstWeekday) % 7;
+  const day = 1 + offset + (occurrence - 1) * 7;
+  return day;
+};
+
+const getLastWeekdayOfMonthUtc = (year, monthIndex, weekday) => {
+  const firstOfNextMonth = new Date(Date.UTC(year, monthIndex + 1, 1));
+  if (Number.isNaN(firstOfNextMonth.getTime())) {
+    return null;
+  }
+  firstOfNextMonth.setUTCDate(firstOfNextMonth.getUTCDate() - 1);
+  while (firstOfNextMonth.getUTCDay() !== weekday) {
+    firstOfNextMonth.setUTCDate(firstOfNextMonth.getUTCDate() - 1);
+  }
+  return firstOfNextMonth.getUTCDate();
+};
+
+// Anonymous Gregorian algorithm.
+const computeEasterSundayUtc = (year) => {
+  if (!Number.isFinite(year)) {
+    return null;
+  }
+  const a = year % 19;
+  const b = Math.floor(year / 100);
+  const c = year % 100;
+  const d = Math.floor(b / 4);
+  const e = b % 4;
+  const f = Math.floor((b + 8) / 25);
+  const g = Math.floor((b - f + 1) / 3);
+  const h = (19 * a + b - d - g + 15) % 30;
+  const i = Math.floor(c / 4);
+  const k = c % 4;
+  const l = (32 + 2 * e + 2 * i - h - k) % 7;
+  const m = Math.floor((a + 11 * h + 22 * l) / 451);
+  const month = Math.floor((h + l - 7 * m + 114) / 31); // 3=March, 4=April
+  const day = ((h + l - 7 * m + 114) % 31) + 1;
+  const date = new Date(Date.UTC(year, month - 1, day));
+  if (Number.isNaN(date.getTime())) {
+    return null;
+  }
+  return date;
+};
+
+const observedFixedHolidayDateKeyUtc = (year, monthIndex, day) => {
+  const date = new Date(Date.UTC(year, monthIndex, day));
+  if (Number.isNaN(date.getTime())) {
+    return null;
+  }
+  const dow = date.getUTCDay();
+  // If the holiday falls on a weekend, NYSE observes it on the nearest weekday.
+  if (dow === 6) {
+    date.setUTCDate(date.getUTCDate() - 1);
+  } else if (dow === 0) {
+    date.setUTCDate(date.getUTCDate() + 1);
+  }
+  return toISODateKey(date);
+};
+
+const getUsMarketHolidayDateKeys = (year) => {
+  if (!Number.isFinite(year) || year < 1900 || year > 2100) {
+    return new Set();
+  }
+  const cached = US_MARKET_HOLIDAYS_CACHE.get(year);
+  if (cached) {
+    return cached;
+  }
+
+  const holidays = new Set();
+  const add = (dateKey) => {
+    if (dateKey && dateKey.startsWith(`${year}-`)) {
+      holidays.add(dateKey);
+    }
+  };
+
+  // Fixed-date holidays (observed).
+  add(observedFixedHolidayDateKeyUtc(year, 0, 1)); // New Year's Day
+  add(observedFixedHolidayDateKeyUtc(year + 1, 0, 1)); // Observed New Year's that can fall on Dec 31 of this year
+  if (year >= 2022) {
+    add(observedFixedHolidayDateKeyUtc(year, 5, 19)); // Juneteenth
+  }
+  add(observedFixedHolidayDateKeyUtc(year, 6, 4)); // Independence Day
+  add(observedFixedHolidayDateKeyUtc(year, 11, 25)); // Christmas Day
+
+  // Monday holidays.
+  add(buildDateKeyUtc(year, 0, getNthWeekdayOfMonthUtc(year, 0, 1, 3))); // MLK Day: 3rd Monday Jan
+  add(buildDateKeyUtc(year, 1, getNthWeekdayOfMonthUtc(year, 1, 1, 3))); // Presidents Day: 3rd Monday Feb
+  add(buildDateKeyUtc(year, 4, getLastWeekdayOfMonthUtc(year, 4, 1))); // Memorial Day: last Monday May
+  add(buildDateKeyUtc(year, 8, getNthWeekdayOfMonthUtc(year, 8, 1, 1))); // Labor Day: 1st Monday Sep
+
+  // Thanksgiving: 4th Thursday Nov.
+  add(buildDateKeyUtc(year, 10, getNthWeekdayOfMonthUtc(year, 10, 4, 4)));
+
+  // Good Friday: Friday before Easter Sunday.
+  const easter = computeEasterSundayUtc(year);
+  if (easter) {
+    const goodFriday = new Date(easter.getTime());
+    goodFriday.setUTCDate(goodFriday.getUTCDate() - 2);
+    add(toISODateKey(goodFriday));
+  }
+
+  US_MARKET_HOLIDAYS_CACHE.set(year, holidays);
+  return holidays;
+};
+
+const isUsMarketHolidayDateKey = (dateKey) => {
+  if (!dateKey || !/^\d{4}-\d{2}-\d{2}$/.test(String(dateKey))) {
+    return false;
+  }
+  const year = Number(String(dateKey).slice(0, 4));
+  if (!Number.isFinite(year)) {
+    return false;
+  }
+  return getUsMarketHolidayDateKeys(year).has(dateKey);
+};
+
+const isMarketClosedDateKey = (dateKey) => isWeekendDateKey(dateKey) || isUsMarketHolidayDateKey(dateKey);
+
 const previousTradingDayKey = (dateKey) => {
   let cursor = shiftDateKeyUtc(dateKey, -1);
   let safety = 0;
-  while (cursor && isWeekendDateKey(cursor) && safety < 7) {
+  while (cursor && isMarketClosedDateKey(cursor) && safety < 14) {
     cursor = shiftDateKeyUtc(cursor, -1);
     safety += 1;
   }
@@ -806,7 +942,7 @@ const computeLastUsMarketCloseDateKey = (value, { dateKeyOverride } = {}) => {
 
   const afterClose = isAfterUsMarketClose(date, { dateKeyOverride });
   if (afterClose) {
-    return isWeekendDateKey(nyDateKey) ? previousTradingDayKey(nyDateKey) : nyDateKey;
+    return isMarketClosedDateKey(nyDateKey) ? previousTradingDayKey(nyDateKey) : nyDateKey;
   }
 
   return previousTradingDayKey(nyDateKey);

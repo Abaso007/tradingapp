@@ -77,6 +77,7 @@ const Layout = ({ children }) => {
       user: undefined,
     });
     localStorage.setItem("auth-token", "");
+    localStorage.removeItem("user");
     navigate("/login");
   };
 

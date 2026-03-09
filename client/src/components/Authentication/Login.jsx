@@ -48,6 +48,9 @@ const Login = () => {
     } else {
       setUserData(loginRes.data);
       localStorage.setItem("auth-token", loginRes.data.token);
+      if (loginRes.data.user) {
+        localStorage.setItem("user", JSON.stringify(loginRes.data.user));
+      }
       navigate("/");
     }
   };

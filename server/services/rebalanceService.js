@@ -639,8 +639,8 @@ const buildRebalanceHumanSummary = ({
       warnings.push(`Price source "${localTool.priceSource}" (recommended Yahoo or Tiingo).`);
     }
     const adjustment = String(localTool.dataAdjustment || '').trim().toLowerCase();
-    if (adjustment && adjustment !== 'split') {
-      warnings.push(`Price adjustment "${localTool.dataAdjustment}" (recommended "split").`);
+    if (adjustment && adjustment !== 'all') {
+      warnings.push(`Price adjustment "${localTool.dataAdjustment}" (recommended "all").`);
     }
     if (warnings.length) {
       lines.push('• WARNING: ' + warnings.join(' '));
@@ -1565,6 +1565,7 @@ const rebalancePortfolio = async (portfolio) => {
         composerEvaluation = await runComposerStrategy({
           strategyText: strategy.strategy,
           budget: composerBudget,
+          requireAsOfDateCoverage: true,
         });
       } catch (error) {
         const missingSymbols = Array.isArray(error?.missingSymbols) ? error.missingSymbols : [];
@@ -1587,6 +1588,7 @@ const rebalancePortfolio = async (portfolio) => {
               strategyText: strategy.strategy,
               budget: composerBudget,
               requireCompleteUniverse: false,
+              requireAsOfDateCoverage: true,
             });
           } catch (fallbackError) {
             error = fallbackError;
