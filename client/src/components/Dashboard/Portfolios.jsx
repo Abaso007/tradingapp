@@ -1036,6 +1036,11 @@ const deleteStrategy = async (strategyId) => {
             <Chip size="small" color={buildSyncColor} label={buildSyncLabel} />
             <Chip size="small" variant="outlined" label={formatBuildChip("FE", frontendBuild)} />
             <Chip size="small" variant="outlined" label={formatBuildChip("BE", backendBuild)} />
+            <Chip
+              size="small"
+              variant="outlined"
+              label={`Loaded ${normalizedPortfolios.length} total / ${polymarketPortfolios.length} polymarket`}
+            />
             <Button size="small" onClick={fetchBuildInfo} disabled={versionLoading}>
               {versionLoading ? "Refreshing…" : "Refresh"}
             </Button>

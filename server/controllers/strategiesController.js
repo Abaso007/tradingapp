@@ -4194,6 +4194,7 @@ exports.getPortfolios = async (req, res) => {
     const requestedUserId = String(req.params.userId || '').trim();
     const userId = String(req.user || '').trim();
     const userKey = userId;
+    const liteMode = ['1', 'true', 'yes'].includes(String(req.query?.lite || '').trim().toLowerCase());
 
     if (!userId) {
       return res.status(401).json({
@@ -4209,7 +4210,13 @@ exports.getPortfolios = async (req, res) => {
       });
     }
 
-    const user = await User.findById(userId);
+    const userObjectId = mongoose.Types.ObjectId.isValid(userId) ? new mongoose.Types.ObjectId(userId) : null;
+    const user = userObjectId
+      ? await mongoose.connection.db.collection('users').findOne(
+          { _id: userObjectId },
+          { projection: { _id: 1 } }
+        )
+      : null;
     if (!user) {
       return res.status(404).json({
         status: 'fail',
@@ -4217,9 +4224,115 @@ exports.getPortfolios = async (req, res) => {
       });
     }
 
-    const rawPortfolios = await Portfolio.find({
-      userId: String(userId),
-    }).lean();
+    const portfoliosCollection = mongoose.connection.db.collection('portfolios');
+    const rawPortfolios = liteMode
+      ? await portfoliosCollection.find(
+          { userId: String(userId) },
+          {
+            projection: {
+              _id: 0,
+              userId: 1,
+              provider: 1,
+              name: 1,
+              strategy_id: 1,
+              recurrence: 1,
+              lastRebalancedAt: 1,
+              nextRebalanceAt: 1,
+              composerHoldingsUpdatedAt: 1,
+              composerHoldingsSource: 1,
+              cashBuffer: 1,
+              retainedCash: 1,
+              initialInvestment: 1,
+              currentValue: 1,
+              pnlValue: 1,
+              pnlPercent: 1,
+              budget: 1,
+              cashLimit: 1,
+              rebalanceCount: 1,
+              'polymarket.address': 1,
+              'polymarket.executionMode': 1,
+              'polymarket.sizeToBudget': 1,
+              'polymarket.seedFromPositions': 1,
+              'polymarket.backfillPending': 1,
+              'polymarket.backfilledAt': 1,
+              'polymarket.lastTradeMatchTime': 1,
+              'polymarket.lastTradeId': 1,
+              'polymarket.sizingState.scale': 1,
+              'polymarket.sizingState.scaleBudget': 1,
+              'polymarket.sizingState.scaleMakerValue': 1,
+              'polymarket.sizingState.scaleSetAt': 1,
+              'polymarket.sizingState.lastUpdatedAt': 1,
+              'alpaca.executionMode': 1,
+            },
+          }
+        ).toArray()
+      : await portfoliosCollection.aggregate([
+          {
+            $match: {
+              userId: String(userId),
+            },
+          },
+          {
+            $project: {
+              _id: 0,
+              userId: 1,
+              provider: 1,
+              name: 1,
+              strategy_id: 1,
+              recurrence: 1,
+              lastRebalancedAt: 1,
+              nextRebalanceAt: 1,
+              composerHoldingsCount: {
+                $size: { $ifNull: ['$composerHoldings', []] },
+              },
+              composerHoldingsUpdatedAt: 1,
+              composerHoldingsSource: 1,
+              cashBuffer: 1,
+              retainedCash: 1,
+              initialInvestment: 1,
+              pnlValue: 1,
+              pnlPercent: 1,
+              budget: 1,
+              cashLimit: 1,
+              rebalanceCount: 1,
+              targetPositions: {
+                $map: {
+                  input: { $ifNull: ['$targetPositions', []] },
+                  as: 'target',
+                  in: {
+                    symbol: '$$target.symbol',
+                    targetQuantity: '$$target.targetQuantity',
+                    targetValue: '$$target.targetValue',
+                    targetWeight: '$$target.targetWeight',
+                    market: '$$target.market',
+                    asset_id: '$$target.asset_id',
+                    outcome: '$$target.outcome',
+                  },
+                },
+              },
+              stocks: {
+                $map: {
+                  input: { $ifNull: ['$stocks', []] },
+                  as: 'stock',
+                  in: {
+                    symbol: '$$stock.symbol',
+                    orderID: '$$stock.orderID',
+                    market: '$$stock.market',
+                    asset_id: '$$stock.asset_id',
+                    outcome: '$$stock.outcome',
+                    avgCost: '$$stock.avgCost',
+                    quantity: '$$stock.quantity',
+                    currentPrice: '$$stock.currentPrice',
+                  },
+                },
+              },
+              polymarket: 1,
+              alpaca: 1,
+            },
+          },
+        ]).toArray();
+
+    const envAlpacaExecutionMode = getEnvAlpacaExecutionMode();
 
     if (!rawPortfolios.length) {
       return res.json({
@@ -4230,7 +4343,135 @@ exports.getPortfolios = async (req, res) => {
       });
     }
 
-    const envAlpacaExecutionMode = getEnvAlpacaExecutionMode();
+    if (liteMode) {
+      const now = new Date();
+      const litePortfolios = rawPortfolios.map((portfolio) => {
+        const provider = getPortfolioProvider(portfolio);
+        const envExecutionMode = provider === 'polymarket' ? getEnvPolymarketExecutionMode() : null;
+        const alpacaRequestedExecutionMode = provider === 'polymarket'
+          ? null
+          : (normalizeAlpacaExecutionModeOverride(portfolio?.alpaca?.executionMode) || 'paper');
+        const alpacaEffectiveExecutionMode =
+          provider === 'polymarket'
+            ? null
+            : envAlpacaExecutionMode === 'live'
+              ? alpacaRequestedExecutionMode
+              : 'paper';
+        const polymarketRequestedExecutionMode =
+          provider === 'polymarket'
+            ? (portfolio?.polymarket?.executionMode
+              ? String(portfolio.polymarket.executionMode).trim().toLowerCase()
+              : 'paper')
+            : 'paper';
+        const polymarketMakerAddress =
+          provider === 'polymarket' && portfolio?.polymarket?.address
+            ? String(portfolio.polymarket.address).trim()
+            : null;
+        const polymarketSizingState =
+          provider === 'polymarket' && portfolio?.polymarket?.sizingState && typeof portfolio.polymarket.sizingState === 'object'
+            ? portfolio.polymarket.sizingState
+            : {};
+        const liteCurrentValue = toNumber(portfolio.currentValue, null);
+        const liteInitialInvestment = toNumber(portfolio.initialInvestment, 0);
+        const litePnlValue = portfolio.pnlValue !== undefined && portfolio.pnlValue !== null
+          ? toNumber(portfolio.pnlValue, null)
+          : (liteCurrentValue !== null ? roundToTwo(liteCurrentValue - liteInitialInvestment) : null);
+        const litePnlPercent = portfolio.pnlPercent !== undefined && portfolio.pnlPercent !== null
+          ? toNumber(portfolio.pnlPercent, null)
+          : (litePnlValue !== null && liteInitialInvestment > 0
+            ? roundToTwo((litePnlValue / liteInitialInvestment) * 100)
+            : null);
+
+        return {
+          provider,
+          name: portfolio.name,
+          strategy_id: portfolio.strategy_id,
+          symphonyUrl: null,
+          recurrence: portfolio.recurrence || 'daily',
+          lastRebalancedAt: portfolio.lastRebalancedAt,
+          nextRebalanceAt: portfolio.nextRebalanceAt,
+          composerHoldingsCount: Number.isFinite(Number(portfolio.composerHoldingsCount))
+            ? Number(portfolio.composerHoldingsCount)
+            : 0,
+          composerHoldingsUpdatedAt: portfolio.composerHoldingsUpdatedAt || null,
+          composerHoldingsSource: portfolio.composerHoldingsSource || null,
+          cashBuffer: toNumber(portfolio.retainedCash, toNumber(portfolio.cashBuffer, 0)),
+          initialInvestment: liteInitialInvestment,
+          currentValue: liteCurrentValue,
+          pnlValue: litePnlValue,
+          pnlPercent: litePnlPercent,
+          targetPositions: [],
+          budget: toNumber(portfolio.budget, null),
+          cashLimit: toNumber(portfolio.cashLimit, toNumber(portfolio.budget, null)),
+          rebalanceCount: toNumber(portfolio.rebalanceCount, 0),
+          status: (() => {
+            const next = portfolio.nextRebalanceAt ? new Date(portfolio.nextRebalanceAt) : null;
+            const last = portfolio.lastRebalancedAt ? new Date(portfolio.lastRebalancedAt) : null;
+            if (next && next <= now) {
+              return 'pending';
+            }
+            if (last) {
+              return 'running';
+            }
+            return 'scheduled';
+          })(),
+          stocks: [],
+          polymarket: provider === 'polymarket'
+            ? {
+                envExecutionMode,
+                executionMode: polymarketRequestedExecutionMode,
+                requestedExecutionMode: polymarketRequestedExecutionMode,
+                effectiveExecutionMode: envExecutionMode === 'live'
+                  ? (portfolio?.polymarket?.executionMode
+                    ? String(portfolio.polymarket.executionMode).trim().toLowerCase()
+                    : 'paper')
+                  : 'paper',
+                makerAddress: polymarketMakerAddress,
+                sizeToBudget: Boolean(portfolio?.polymarket?.sizeToBudget),
+                seedFromPositions: Boolean(portfolio?.polymarket?.seedFromPositions),
+                backfillPending: Boolean(portfolio?.polymarket?.backfillPending),
+                backfilledAt: portfolio?.polymarket?.backfilledAt ? String(portfolio.polymarket.backfilledAt) : null,
+                lastTradeMatchTime: portfolio?.polymarket?.lastTradeMatchTime ? String(portfolio.polymarket.lastTradeMatchTime) : null,
+                lastTradeId: portfolio?.polymarket?.lastTradeId ? String(portfolio.polymarket.lastTradeId) : null,
+                sizing: {
+                  scale: toNumber(polymarketSizingState?.scale, null),
+                  scaleBudget: toNumber(polymarketSizingState?.scaleBudget, null),
+                  scaleMakerValue: toNumber(polymarketSizingState?.scaleMakerValue, null),
+                  scaleSetAt: polymarketSizingState?.scaleSetAt ? String(polymarketSizingState.scaleSetAt) : null,
+                  lastUpdatedAt: polymarketSizingState?.lastUpdatedAt ? String(polymarketSizingState.lastUpdatedAt) : null,
+                },
+              }
+            : null,
+          alpaca: provider === 'polymarket'
+            ? null
+            : {
+                envExecutionMode: envAlpacaExecutionMode,
+                executionMode: alpacaRequestedExecutionMode,
+                requestedExecutionMode: alpacaRequestedExecutionMode,
+                effectiveExecutionMode: alpacaEffectiveExecutionMode,
+              },
+          isRealMoney:
+            (provider === 'polymarket' &&
+              envExecutionMode === 'live' &&
+              String(portfolio?.polymarket?.executionMode || '').trim().toLowerCase() === 'live') ||
+            (provider !== 'polymarket' &&
+              envAlpacaExecutionMode === 'live' &&
+              alpacaRequestedExecutionMode === 'live'),
+          isRealMoneyRequested:
+            (provider === 'polymarket' &&
+              String(portfolio?.polymarket?.executionMode || '').trim().toLowerCase() === 'live') ||
+            (provider !== 'polymarket' && alpacaRequestedExecutionMode === 'live'),
+        };
+      });
+
+      return res.json({
+        status: 'success',
+        cash: 0,
+        cashByMode: { paper: null, live: null },
+        portfolios: litePortfolios,
+      });
+    }
+
     const normalizeTimeoutMs = (value, fallback) => {
       const fallbackMs =
         Number.isFinite(Number(fallback)) && Number(fallback) > 0 ? Math.floor(Number(fallback)) : 5000;
@@ -4245,6 +4486,10 @@ exports.getPortfolios = async (req, res) => {
       5000
     );
     const priceTimeoutMs = normalizeTimeoutMs(process.env.ALPACA_PORTFOLIOS_PRICE_TIMEOUT_MS, snapshotTimeoutMs);
+    const totalExternalBudgetMs = normalizeTimeoutMs(
+      process.env.ALPACA_PORTFOLIOS_TOTAL_TIMEOUT_MS,
+      Math.max(snapshotTimeoutMs, 5000)
+    );
     const latestTradesBatchSize = (() => {
       const parsed = Number(process.env.ALPACA_LATEST_TRADES_BATCH_SIZE);
       if (!Number.isFinite(parsed) || parsed <= 0) {
@@ -4252,6 +4497,25 @@ exports.getPortfolios = async (req, res) => {
       }
       return Math.max(1, Math.min(Math.floor(parsed), 1000));
     })();
+    const enrichmentStartedAtMs = Date.now();
+    const getRemainingExternalBudgetMs = () => {
+      const elapsedMs = Date.now() - enrichmentStartedAtMs;
+      return Math.max(0, totalExternalBudgetMs - elapsedMs);
+    };
+    const getBoundedTimeoutMs = (preferredMs) => {
+      const remainingMs = getRemainingExternalBudgetMs();
+      if (!Number.isFinite(remainingMs) || remainingMs <= 0) {
+        return 0;
+      }
+      if (remainingMs < 250) {
+        return Math.floor(remainingMs);
+      }
+      const preferred = Number(preferredMs);
+      if (!Number.isFinite(preferred) || preferred <= 0) {
+        return remainingMs;
+      }
+      return Math.max(250, Math.min(Math.floor(preferred), remainingMs));
+    };
 
     const withHardTimeout = async (timeoutMs, task) => {
       const ms = Number(timeoutMs);
@@ -4279,7 +4543,7 @@ exports.getPortfolios = async (req, res) => {
       }
     };
 
-    const needsLiveSnapshot = envAlpacaExecutionMode === 'live' && rawPortfolios.some((portfolio) => {
+    const needsLiveSnapshot = !liteMode && envAlpacaExecutionMode === 'live' && rawPortfolios.some((portfolio) => {
       const provider = getPortfolioProvider(portfolio);
       if (provider === 'polymarket') {
         return false;
@@ -4288,7 +4552,7 @@ exports.getPortfolios = async (req, res) => {
       return requested === 'live';
     });
 
-    const needsPaperSnapshot = rawPortfolios.some((portfolio) => {
+    const needsPaperSnapshot = !liteMode && rawPortfolios.some((portfolio) => {
       const provider = getPortfolioProvider(portfolio);
       if (provider === 'polymarket') {
         return false;
@@ -4302,6 +4566,10 @@ exports.getPortfolios = async (req, res) => {
 
     const fetchSnapshot = async (mode) => {
       try {
+        const boundedSnapshotTimeoutMs = getBoundedTimeoutMs(snapshotTimeoutMs);
+        if (boundedSnapshotTimeoutMs <= 0) {
+          return null;
+        }
         const alpacaConfig = await getAlpacaConfig(userId, mode);
         if (!alpacaConfig?.hasValidKeys) {
           return null;
@@ -4311,9 +4579,9 @@ exports.getPortfolios = async (req, res) => {
         const dataKeys = alpacaConfig.getDataKeys();
 
         const [positionsResponse, accountResponse] = await Promise.all([
-          withHardTimeout(snapshotTimeoutMs, (signal) =>
+          withHardTimeout(boundedSnapshotTimeoutMs, (signal) =>
             tradingKeys.client.get(`${tradingKeys.apiUrl}/v2/positions`, {
-              timeout: snapshotTimeoutMs,
+              timeout: boundedSnapshotTimeoutMs,
               ...(signal ? { signal } : {}),
               headers: {
                 'APCA-API-KEY-ID': tradingKeys.keyId,
@@ -4321,9 +4589,9 @@ exports.getPortfolios = async (req, res) => {
               },
             })
           ),
-          withHardTimeout(snapshotTimeoutMs, (signal) =>
+          withHardTimeout(boundedSnapshotTimeoutMs, (signal) =>
             tradingKeys.client.get(`${tradingKeys.apiUrl}/v2/account`, {
-              timeout: snapshotTimeoutMs,
+              timeout: boundedSnapshotTimeoutMs,
               ...(signal ? { signal } : {}),
               headers: {
                 'APCA-API-KEY-ID': tradingKeys.keyId,
@@ -4407,7 +4675,7 @@ exports.getPortfolios = async (req, res) => {
       });
     });
 
-    if (symbolsToFetch.size && dataKeys) {
+    if (!liteMode && symbolsToFetch.size && dataKeys) {
       const headers = {
         'APCA-API-KEY-ID': dataKeys.keyId,
         'APCA-API-SECRET-KEY': dataKeys.secretKey,
@@ -4416,11 +4684,15 @@ exports.getPortfolios = async (req, res) => {
       let batchSupported = true;
 
       const fetchLatestTradesBatch = async (symbolChunk) => {
-        const response = await withHardTimeout(priceTimeoutMs, (signal) =>
+        const boundedPriceTimeoutMs = getBoundedTimeoutMs(priceTimeoutMs);
+        if (boundedPriceTimeoutMs <= 0) {
+          throw new Error('budget_exhausted');
+        }
+        const response = await withHardTimeout(boundedPriceTimeoutMs, (signal) =>
           dataKeys.client.get(`${dataKeys.apiUrl}/v2/stocks/trades/latest`, {
             headers,
             params: { symbols: symbolChunk.join(',') },
-            timeout: priceTimeoutMs,
+            timeout: boundedPriceTimeoutMs,
             ...(signal ? { signal } : {}),
           })
         );
@@ -4443,10 +4715,14 @@ exports.getPortfolios = async (req, res) => {
         await Promise.all(
           symbolChunk.map(async (symbol) => {
             try {
-              const response = await withHardTimeout(priceTimeoutMs, (signal) =>
+              const boundedPriceTimeoutMs = getBoundedTimeoutMs(priceTimeoutMs);
+              if (boundedPriceTimeoutMs <= 0) {
+                return;
+              }
+              const response = await withHardTimeout(boundedPriceTimeoutMs, (signal) =>
                 dataKeys.client.get(`${dataKeys.apiUrl}/v2/stocks/${symbol}/trades/latest`, {
                   headers,
-                  timeout: priceTimeoutMs,
+                  timeout: boundedPriceTimeoutMs,
                   ...(signal ? { signal } : {}),
                 })
               );
@@ -4464,6 +4740,9 @@ exports.getPortfolios = async (req, res) => {
 
       let priceFetchEnabled = true;
       for (let idx = 0; idx < symbols.length; idx += latestTradesBatchSize) {
+        if (getRemainingExternalBudgetMs() <= 0) {
+          break;
+        }
         const chunk = symbols.slice(idx, idx + latestTradesBatchSize);
         if (!priceFetchEnabled) {
           break;
@@ -4473,6 +4752,9 @@ exports.getPortfolios = async (req, res) => {
             await fetchLatestTradesBatch(chunk);
             continue;
           } catch (error) {
+            if (error?.message === 'budget_exhausted') {
+              break;
+            }
             if (error?.response?.status === 404) {
               batchSupported = false;
             } else {
@@ -4498,17 +4780,25 @@ exports.getPortfolios = async (req, res) => {
       )
     );
     if (strategyIds.length) {
-      const rows = await Strategy.find({
-        strategy_id: { $in: strategyIds },
-        $or: [
-          { userId: userKey },
-          { userId: null },
-          { userId: '' },
-          { userId: { $exists: false } },
-        ],
-      })
-        .select('strategy_id symphonyUrl userId')
-        .lean()
+      const rows = await mongoose.connection.db.collection('strategies').find(
+        {
+          strategy_id: { $in: strategyIds },
+          $or: [
+            { userId: userKey },
+            { userId: null },
+            { userId: '' },
+            { userId: { $exists: false } },
+          ],
+        },
+        {
+          projection: {
+            strategy_id: 1,
+            symphonyUrl: 1,
+            userId: 1,
+          },
+        }
+      )
+        .toArray()
         .catch(() => []);
 
       rows.forEach((row) => {
@@ -4694,7 +4984,9 @@ exports.getPortfolios = async (req, res) => {
         recurrence: portfolio.recurrence || 'daily',
         lastRebalancedAt: portfolio.lastRebalancedAt,
         nextRebalanceAt: portfolio.nextRebalanceAt,
-        composerHoldingsCount: Array.isArray(portfolio.composerHoldings) ? portfolio.composerHoldings.length : 0,
+        composerHoldingsCount: Number.isFinite(Number(portfolio.composerHoldingsCount))
+          ? Number(portfolio.composerHoldingsCount)
+          : Array.isArray(portfolio.composerHoldings) ? portfolio.composerHoldings.length : 0,
         composerHoldingsUpdatedAt: portfolio.composerHoldingsUpdatedAt || null,
         composerHoldingsSource: portfolio.composerHoldingsSource || null,
         cashBuffer: retainedCash,

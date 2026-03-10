@@ -123,12 +123,12 @@ const Dashboard = ({ userData, setUserData, onViewStrategyLogs }) => {
         setPortfolios([]);
         return;
       }
-      const url = config.base_url + `/api/strategies/portfolios/${userId}`;
+      const url = config.base_url + `/api/strategies/portfolios/${userId}?lite=1`;
       const headers = {
         "x-auth-token": token,
       };
   
-      const response = await Axios.get(url, { headers });
+      const response = await Axios.get(url, { headers, timeout: 10000 });
   
       if (response.data.status === "success") {
         setPortfolios(response.data.portfolios);
