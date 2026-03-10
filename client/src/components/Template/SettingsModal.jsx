@@ -1,4 +1,4 @@
-import React, { useState, useContext } from "react";
+import React, { useState, useContext, useEffect, useCallback } from "react";
 import UserContext from "../../context/UserContext";
 import styles from "./PageTemplate.module.css";
 
@@ -46,9 +46,70 @@ const SettingsModalContent = ({ setSettingsOpen }) => {
   const [showJwt, setShowJwt] = useState(false);
   const [jwtCopied, setJwtCopied] = useState(false);
   const [userIdCopied, setUserIdCopied] = useState(false);
+  const [debugInfoCopied, setDebugInfoCopied] = useState(false);
+  const [frontendBuild, setFrontendBuild] = useState(null);
+  const [backendBuild, setBackendBuild] = useState(null);
+  const [versionLoading, setVersionLoading] = useState(false);
+  const [versionError, setVersionError] = useState(null);
 
   const alpacaKeysPresent = Boolean(userData?.user?.alpacaKeysPresent);
   const alpacaKeyIdMasked = userData?.user?.alpacaKeyIdMasked || null;
+
+  const formatBuildLine = (build, extra = []) => {
+    if (!build || typeof build !== "object") {
+      return "Unavailable";
+    }
+    const parts = [];
+    if (build.version) parts.push(`v${build.version}`);
+    if (build.gitSha) parts.push(String(build.gitSha).slice(0, 12));
+    if (build.gitRef) parts.push(String(build.gitRef));
+    if (build.builtAt) parts.push(`built ${build.builtAt}`);
+    extra.filter(Boolean).forEach((value) => parts.push(value));
+    return parts.length ? parts.join(" | ") : "Unavailable";
+  };
+
+  const fetchBuildInfo = useCallback(async () => {
+    setVersionLoading(true);
+    setVersionError(null);
+    try {
+      const cacheBuster = `t=${Date.now()}`;
+      const [frontendRes, backendRes] = await Promise.all([
+        Axios.get(`/build-meta.json?${cacheBuster}`, { validateStatus: () => true }),
+        Axios.get(`${config.base_url}/api/version?${cacheBuster}`, { validateStatus: () => true }),
+      ]);
+
+      if (frontendRes.status >= 200 && frontendRes.status < 300 && frontendRes.data) {
+        setFrontendBuild(frontendRes.data);
+      } else {
+        setFrontendBuild(null);
+      }
+
+      if (backendRes.status >= 200 && backendRes.status < 300 && backendRes.data?.build) {
+        setBackendBuild(backendRes.data.build);
+      } else {
+        setBackendBuild(null);
+      }
+    } catch (error) {
+      setVersionError(error?.message || "Unable to load version info.");
+      setFrontendBuild(null);
+      setBackendBuild(null);
+    } finally {
+      setVersionLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    fetchBuildInfo();
+  }, [fetchBuildInfo]);
+
+  const syncStatus = (() => {
+    const frontendSha = frontendBuild?.gitSha ? String(frontendBuild.gitSha) : null;
+    const backendSha = backendBuild?.gitSha ? String(backendBuild.gitSha) : null;
+    if (frontendSha && backendSha) {
+      return frontendSha === backendSha ? "In sync" : "Mismatch";
+    }
+    return "Unknown";
+  })();
 
   const handleApiKeyChange = (event) => {
     setApiKeyId(event.target.value);
@@ -195,6 +256,71 @@ const SettingsModalContent = ({ setSettingsOpen }) => {
                     disabled={!userData.token}
                   >
                     {jwtCopied ? "Copied JWT" : "Copy JWT"}
+                  </Button>
+                </Box>
+
+                <Divider sx={{ my: 2 }} />
+                <Typography component="h2" variant="subtitle1" align="center">
+                  Version / Debug
+                </Typography>
+                <TextField
+                  variant="outlined"
+                  margin="normal"
+                  fullWidth
+                  InputProps={{ readOnly: true }}
+                  id="frontend_build"
+                  label="Frontend build"
+                  value={formatBuildLine(frontendBuild)}
+                />
+                <TextField
+                  variant="outlined"
+                  margin="normal"
+                  fullWidth
+                  InputProps={{ readOnly: true }}
+                  id="backend_build"
+                  label="Backend build"
+                  value={formatBuildLine(backendBuild, backendBuild?.startedAt ? [`started ${backendBuild.startedAt}`] : [])}
+                />
+                <TextField
+                  variant="outlined"
+                  margin="normal"
+                  fullWidth
+                  InputProps={{ readOnly: true }}
+                  id="build_sync_status"
+                  label="Frontend/Backend sync"
+                  value={syncStatus}
+                />
+                {versionError && (
+                  <Typography component="p" variant="caption" align="center" sx={{ mt: 1, color: "#b00020" }}>
+                    {versionError}
+                  </Typography>
+                )}
+                <Box display="flex" justifyContent="center" gap={1} flexWrap="wrap" sx={{ mt: 1 }}>
+                  <Button variant="outlined" onClick={fetchBuildInfo} disabled={versionLoading}>
+                    {versionLoading ? "Refreshing…" : "Refresh version info"}
+                  </Button>
+                  <Button
+                    variant={debugInfoCopied ? "contained" : "outlined"}
+                    onClick={() =>
+                      copyWithFallback(
+                        JSON.stringify(
+                          {
+                            fetchedAt: new Date().toISOString(),
+                            apiBaseUrl: config.base_url || null,
+                            frontendOrigin: window.location.origin,
+                            userId: userData?.user?.id || null,
+                            frontendBuild,
+                            backendBuild,
+                            syncStatus,
+                          },
+                          null,
+                          2
+                        ),
+                        setDebugInfoCopied
+                      )
+                    }
+                  >
+                    {debugInfoCopied ? "Copied debug info" : "Copy debug info"}
                   </Button>
                 </Box>
 

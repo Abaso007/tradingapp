@@ -1,0 +1,7 @@
+{
+  "service": "tradingapp-web",
+  "version": "1.0.0",
+  "gitSha": "f0517b0e6db47ee615f0e6454bd6bcda874ff554",
+  "gitRef": "master",
+  "builtAt": "2026-03-10T09:27:55.587Z"
+}

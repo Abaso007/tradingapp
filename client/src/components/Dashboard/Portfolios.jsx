@@ -1,4 +1,4 @@
-import React, { useContext, useEffect, useState } from "react";
+import React, { useCallback, useContext, useEffect, useState } from "react";
 import { Link, Collapse, IconButton, Modal, Button, Typography, useTheme, LinearProgress, Box, TextField, MenuItem, CircularProgress, Tooltip, Dialog, DialogTitle, DialogContent, DialogActions, Divider, Chip } from "@mui/material";
 import Table from "@mui/material/Table";
 import TableBody from "@mui/material/TableBody";
@@ -25,6 +25,7 @@ import {
   copyTextToClipboard,
   suggestAiPortfolioSymbol,
 } from "../../utils/aiportfolioIntegration";
+import { normalizePortfolioProvider } from "../../utils/portfolioProvider";
 
 
 
@@ -105,6 +106,10 @@ const Portfolios = ({ portfolios, onViewStrategyLogs, refreshPortfolios }) => {
   const [polymarketBalance, setPolymarketBalance] = useState(null);
   const [polymarketBalanceLoading, setPolymarketBalanceLoading] = useState(false);
   const [polymarketBalanceError, setPolymarketBalanceError] = useState(null);
+  const [frontendBuild, setFrontendBuild] = useState(null);
+  const [backendBuild, setBackendBuild] = useState(null);
+  const [versionLoading, setVersionLoading] = useState(false);
+  const [versionError, setVersionError] = useState(null);
 
   useEffect(() => {
     try {
@@ -113,6 +118,40 @@ const Portfolios = ({ portfolios, onViewStrategyLogs, refreshPortfolios }) => {
       // ignore storage errors
     }
   }, [portfolioFilter]);
+
+  const fetchBuildInfo = useCallback(async () => {
+    setVersionLoading(true);
+    setVersionError(null);
+    try {
+      const cacheBuster = `t=${Date.now()}`;
+      const [frontendRes, backendRes] = await Promise.all([
+        Axios.get(`/build-meta.json?${cacheBuster}`, { validateStatus: () => true }),
+        Axios.get(`${config.base_url}/api/version?${cacheBuster}`, { validateStatus: () => true }),
+      ]);
+
+      if (frontendRes.status >= 200 && frontendRes.status < 300 && frontendRes.data) {
+        setFrontendBuild(frontendRes.data);
+      } else {
+        setFrontendBuild(null);
+      }
+
+      if (backendRes.status >= 200 && backendRes.status < 300 && backendRes.data?.build) {
+        setBackendBuild(backendRes.data.build);
+      } else {
+        setBackendBuild(null);
+      }
+    } catch (error) {
+      setVersionError(error?.message || "Unable to load version info.");
+      setFrontendBuild(null);
+      setBackendBuild(null);
+    } finally {
+      setVersionLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    fetchBuildInfo();
+  }, [fetchBuildInfo]);
 
   useEffect(() => {
     const hasLivePolymarket = Array.isArray(portfolios) && portfolios.some((portfolio) => {
@@ -882,7 +921,25 @@ const deleteStrategy = async (strategyId) => {
     setStrategyToResend(null);
   };
 
-  const normalizedPortfolios = Array.isArray(portfolios) ? portfolios : [];
+  const formatBuildChip = (label, build) => {
+    const version = build?.version ? `v${build.version}` : null;
+    const sha = build?.gitSha ? String(build.gitSha).slice(0, 8) : null;
+    const value = [version, sha].filter(Boolean).join(" ");
+    return value ? `${label} ${value}` : `${label} unknown`;
+  };
+
+  const formatBuildTimestamp = (value) => {
+    if (!value) {
+      return "—";
+    }
+    const date = new Date(value);
+    if (Number.isNaN(date.getTime())) {
+      return String(value);
+    }
+    return date.toLocaleString();
+  };
+
+  const normalizedPortfolios = Array.isArray(portfolios) ? portfolios.map(normalizePortfolioProvider) : [];
   const polymarketPortfolios = normalizedPortfolios.filter((portfolio) => {
     return String(portfolio?.provider || "").toLowerCase() === "polymarket";
   });
@@ -925,6 +982,24 @@ const deleteStrategy = async (strategyId) => {
     portfolioFilter === "real_money" ||
     portfolioFilter === "polymarket_real_money";
 
+  const frontendSha = frontendBuild?.gitSha ? String(frontendBuild.gitSha) : null;
+  const backendSha = backendBuild?.gitSha ? String(backendBuild.gitSha) : null;
+  const buildSyncState = frontendSha && backendSha
+    ? (frontendSha === backendSha ? "match" : "mismatch")
+    : "unknown";
+  const buildSyncLabel =
+    buildSyncState === "match"
+      ? "Frontend/backend commit match"
+      : buildSyncState === "mismatch"
+        ? "Frontend/backend commit mismatch"
+        : "Frontend/backend version unknown";
+  const buildSyncColor =
+    buildSyncState === "match"
+      ? "success"
+      : buildSyncState === "mismatch"
+        ? "warning"
+        : "default";
+
   return (
     <React.Fragment>
       <Title>
@@ -944,6 +1019,38 @@ const deleteStrategy = async (strategyId) => {
       )}
 
       <Collapse in={openStrategies}>
+        <Box
+          sx={{
+            ml: 6,
+            mb: 2,
+            mr: 2,
+            px: 1.5,
+            py: 1,
+            borderRadius: 1,
+            border: "1px solid",
+            borderColor: buildSyncState === "mismatch" ? "warning.light" : "divider",
+            backgroundColor: buildSyncState === "mismatch" ? "rgba(237, 108, 2, 0.08)" : "background.paper",
+          }}
+        >
+          <Box sx={{ display: "flex", alignItems: "center", gap: 1, flexWrap: "wrap" }}>
+            <Chip size="small" color={buildSyncColor} label={buildSyncLabel} />
+            <Chip size="small" variant="outlined" label={formatBuildChip("FE", frontendBuild)} />
+            <Chip size="small" variant="outlined" label={formatBuildChip("BE", backendBuild)} />
+            <Button size="small" onClick={fetchBuildInfo} disabled={versionLoading}>
+              {versionLoading ? "Refreshing…" : "Refresh"}
+            </Button>
+          </Box>
+          <Typography variant="caption" color={versionError ? "error" : "textSecondary"} sx={{ display: "block", mt: 0.75 }}>
+            {versionError
+              ? versionError
+              : `Frontend built ${formatBuildTimestamp(frontendBuild?.builtAt)} · Backend started ${formatBuildTimestamp(backendBuild?.startedAt)}`}
+          </Typography>
+          {buildSyncState === "mismatch" && (
+            <Typography variant="caption" color="warning.main" sx={{ display: "block", mt: 0.25 }}>
+              Hard-refresh the browser and restart the backend before testing UI fixes.
+            </Typography>
+          )}
+        </Box>
         <Box sx={{ ml: 6, mt: 1, mb: 2, maxWidth: 260 }}>
           <TextField
             select

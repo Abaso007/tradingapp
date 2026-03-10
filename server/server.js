@@ -106,6 +106,7 @@ const {
   getPolymarketExecutionDebugInfo,
 } = require('./services/polymarketExecutionService');
 const { getNextPolymarketProxyConfig, getPolymarketHttpsAgent } = require('./services/polymarketProxyPoolService');
+const { getBuildInfo } = require('./utils/buildInfo');
 
 mongoose.set('bufferCommands', false);
 
@@ -306,6 +307,22 @@ app.get("/", (req, res) => {
     status: "ok",
     service: "tradingapp-api",
     timestamp: Date.now(),
+  });
+});
+
+app.get("/api/version", (req, res) => {
+  const build = getBuildInfo();
+  res.setHeader("Cache-Control", "no-store");
+  if (build?.gitSha) {
+    res.setHeader("x-tradingapp-backend-gitsha", build.gitSha);
+  }
+  if (build?.version) {
+    res.setHeader("x-tradingapp-backend-version", build.version);
+  }
+  res.json({
+    status: "ok",
+    timestamp: Date.now(),
+    build,
   });
 });
 

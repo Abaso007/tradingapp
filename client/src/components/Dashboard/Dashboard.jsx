@@ -13,6 +13,7 @@ import Orders from "./Orders";
 import Copyright from "../Template/Copyright";
 import Title from "../Template/Title.jsx";
 import { logDebug, logWarn, logError } from "../../utils/logger";
+import { normalizePortfolioProvider } from "../../utils/portfolioProvider";
 
 const StyledPaper = styled(Paper)(({ theme }) => ({
   padding: theme.spacing(2),
@@ -34,7 +35,8 @@ const Dashboard = ({ userData, setUserData, onViewStrategyLogs }) => {
   const [portfolios, setPortfolios] = useState([]);
   const userId = userData?.user?.id;
   const token = userData?.token;
-  const polymarketVirtualFunds = (portfolios || []).reduce((sum, portfolio) => {
+  const normalizedPortfolios = Array.isArray(portfolios) ? portfolios.map(normalizePortfolioProvider) : [];
+  const polymarketVirtualFunds = normalizedPortfolios.reduce((sum, portfolio) => {
     if (portfolio?.provider !== "polymarket") {
       return sum;
     }
@@ -171,7 +173,7 @@ const Dashboard = ({ userData, setUserData, onViewStrategyLogs }) => {
           <StyledPaper>
             <Portfolios
               accountBalance={accountBalance}
-              portfolios={portfolios}
+              portfolios={normalizedPortfolios}
               onViewStrategyLogs={onViewStrategyLogs}
               refreshPortfolios={getPortfolio}
             />
