@@ -119,6 +119,15 @@ const POLYMARKET_LIVE_REBALANCE_MIN_NOTIONAL = (() => {
   }
   return Math.max(0.01, Math.min(parsed, 1000000));
 })();
+const POLYMARKET_ILLIQUID_TOKEN_COOLDOWN_MS = (() => {
+  const parsed = Number(
+    process.env.POLYMARKET_ILLIQUID_TOKEN_COOLDOWN_MS || process.env.POLYMARKET_NO_LIQUIDITY_COOLDOWN_MS
+  );
+  if (!Number.isFinite(parsed) || parsed <= 0) {
+    return 10 * 60 * 1000;
+  }
+  return Math.max(0, Math.min(Math.floor(parsed), 24 * 60 * 60 * 1000));
+})();
 
 const POLYMARKET_PROXY_REQUEST_ATTEMPTS = (() => {
   const parsed = Number(process.env.POLYMARKET_PROXY_REQUEST_ATTEMPTS);
@@ -221,6 +230,14 @@ const roundToDecimals = (value, decimals = 6) => {
   const places = Math.max(0, Math.min(12, Number(decimals) || 0));
   const factor = 10 ** places;
   return Math.round((num + Number.EPSILON) * factor) / factor;
+};
+
+const parseTimestampMs = (value) => {
+  if (value === null || value === undefined || value === '') {
+    return null;
+  }
+  const parsed = Date.parse(String(value));
+  return Number.isFinite(parsed) ? parsed : null;
 };
 
 const buildGeoParams = (params = {}) => {
@@ -1130,6 +1147,120 @@ const syncPolymarketPortfolioInternal = async (portfolio, options = {}) => {
     untradeableTokenIdsDirty = true;
     return true;
   };
+  const MAX_LIQUIDITY_BLOCKS = 200;
+  const liquidityBlocks = new Map(
+    (Array.isArray(poly?.liquidityBlocks) ? poly.liquidityBlocks : [])
+      .map((entry) => {
+        const assetId = String(entry?.asset_id || '').trim();
+        if (!assetId) {
+          return null;
+        }
+        const buyBlockedUntilMs = parseTimestampMs(entry?.buyBlockedUntil);
+        const sellBlockedUntilMs = parseTimestampMs(entry?.sellBlockedUntil);
+        if (!buyBlockedUntilMs && !sellBlockedUntilMs) {
+          return null;
+        }
+        return [
+          assetId,
+          {
+            asset_id: assetId,
+            buyBlockedUntilMs,
+            sellBlockedUntilMs,
+            reason: entry?.reason ? String(entry.reason).trim() : null,
+            updatedAtMs: parseTimestampMs(entry?.updatedAt),
+          },
+        ];
+      })
+      .filter(Boolean)
+  );
+  let liquidityBlocksDirty = false;
+  const pruneLiquidityBlocks = (atMs = Date.now()) => {
+    for (const [assetId, entry] of liquidityBlocks.entries()) {
+      if (!entry || typeof entry !== 'object') {
+        liquidityBlocks.delete(assetId);
+        liquidityBlocksDirty = true;
+        continue;
+      }
+      const nextEntry = {
+        ...entry,
+        buyBlockedUntilMs:
+          entry.buyBlockedUntilMs && entry.buyBlockedUntilMs > atMs ? entry.buyBlockedUntilMs : null,
+        sellBlockedUntilMs:
+          entry.sellBlockedUntilMs && entry.sellBlockedUntilMs > atMs ? entry.sellBlockedUntilMs : null,
+      };
+      if (!nextEntry.buyBlockedUntilMs && !nextEntry.sellBlockedUntilMs) {
+        liquidityBlocks.delete(assetId);
+        liquidityBlocksDirty = true;
+        continue;
+      }
+      if (
+        nextEntry.buyBlockedUntilMs !== entry.buyBlockedUntilMs ||
+        nextEntry.sellBlockedUntilMs !== entry.sellBlockedUntilMs
+      ) {
+        liquidityBlocks.set(assetId, nextEntry);
+        liquidityBlocksDirty = true;
+      }
+    }
+  };
+  const getLiquidityBlockState = (tokenId, atMs = Date.now()) => {
+    const key = String(tokenId || '').trim();
+    if (!key) {
+      return {
+        buyBlocked: false,
+        sellBlocked: false,
+        buyBlockedUntilMs: null,
+        sellBlockedUntilMs: null,
+        reason: null,
+      };
+    }
+    const entry = liquidityBlocks.get(key) || null;
+    const buyBlockedUntilMs = entry?.buyBlockedUntilMs && entry.buyBlockedUntilMs > atMs ? entry.buyBlockedUntilMs : null;
+    const sellBlockedUntilMs =
+      entry?.sellBlockedUntilMs && entry.sellBlockedUntilMs > atMs ? entry.sellBlockedUntilMs : null;
+    return {
+      buyBlocked: Boolean(buyBlockedUntilMs),
+      sellBlocked: Boolean(sellBlockedUntilMs),
+      buyBlockedUntilMs,
+      sellBlockedUntilMs,
+      reason: entry?.reason || null,
+    };
+  };
+  const noteLiquidityBlock = ({ tokenId, side, reason = null, atMs = Date.now() } = {}) => {
+    if (POLYMARKET_ILLIQUID_TOKEN_COOLDOWN_MS <= 0) {
+      return false;
+    }
+    const key = String(tokenId || '').trim();
+    const normalizedSide = String(side || '').trim().toUpperCase();
+    if (!key || (normalizedSide !== 'BUY' && normalizedSide !== 'SELL')) {
+      return false;
+    }
+    const nextBlockedUntilMs = atMs + POLYMARKET_ILLIQUID_TOKEN_COOLDOWN_MS;
+    const existing = liquidityBlocks.get(key) || {
+      asset_id: key,
+      buyBlockedUntilMs: null,
+      sellBlockedUntilMs: null,
+      reason: null,
+      updatedAtMs: null,
+    };
+    const currentBlockedUntilMs =
+      normalizedSide === 'BUY' ? existing.buyBlockedUntilMs : existing.sellBlockedUntilMs;
+    if (currentBlockedUntilMs && currentBlockedUntilMs >= nextBlockedUntilMs && existing.reason === reason) {
+      return false;
+    }
+    const nextEntry = {
+      ...existing,
+      asset_id: key,
+      reason: reason ? String(reason).trim() : existing.reason,
+      updatedAtMs: atMs,
+      ...(normalizedSide === 'BUY'
+        ? { buyBlockedUntilMs: Math.max(existing.buyBlockedUntilMs || 0, nextBlockedUntilMs) }
+        : { sellBlockedUntilMs: Math.max(existing.sellBlockedUntilMs || 0, nextBlockedUntilMs) }),
+    };
+    liquidityBlocks.set(key, nextEntry);
+    liquidityBlocksDirty = true;
+    return true;
+  };
+  pruneLiquidityBlocks();
 
   const envExecutionMode = getPolymarketExecutionMode();
   const portfolioExecutionMode = normalizeExecutionModeOverride(poly.executionMode) || 'paper';
@@ -2894,8 +3025,14 @@ const syncPolymarketPortfolioInternal = async (portfolio, options = {}) => {
 
 	    const targetAssetIds = new Set();
 	    const nextStocks = [];
-	    let extraCashFromUntradeable = 0;
-	    let untradeableMakerCount = 0;
+      let blockedCashAdjustment = 0;
+      const blockedUntradeableAssetIds = new Set();
+      const blockedIlliquidBuyAssetIds = new Set();
+      const blockedIlliquidSellAssetIds = new Set();
+      let blockedUntradeableBuyNotional = 0;
+      let blockedUntradeableSellNotional = 0;
+      let blockedIlliquidBuyNotional = 0;
+      let blockedIlliquidSellNotional = 0;
 
 	    for (const pos of makerHoldings) {
 	      const market = pos.market ? String(pos.market) : null;
@@ -2906,39 +3043,100 @@ const syncPolymarketPortfolioInternal = async (portfolio, options = {}) => {
 	      const outcome = pos.outcome ? String(pos.outcome) : null;
 	      const avgCost = toNumber(pos.avgCost, null);
 	      const currentPrice = toNumber(pos.currentPrice, null);
-	      const quantity = roundToDecimals(Math.max(0, toNumber(pos.quantity, 0)) * scale, 6) ?? 0;
-	      if (!quantity || quantity <= 0) {
+        const currentHolding = holdingsByAssetId.get(asset_id) || null;
+        const currentQty = roundToDecimals(Math.max(0, toNumber(currentHolding?.quantity, 0)), 6) ?? 0;
+        const liquidityBlock = getLiquidityBlockState(asset_id);
+        const permanentlyBlocked = untradeableTokenIds.has(asset_id);
+        const buyBlocked = permanentlyBlocked || liquidityBlock.buyBlocked;
+        const sellBlocked = permanentlyBlocked || liquidityBlock.sellBlocked;
+	      const desiredQuantity = roundToDecimals(Math.max(0, toNumber(pos.quantity, 0)) * scale, 6) ?? 0;
+	      if (!desiredQuantity || desiredQuantity <= 0) {
 	        continue;
 	      }
+        let quantity = desiredQuantity;
+        let preserveCurrentHolding = false;
 
-	      if (untradeableTokenIds.has(asset_id)) {
-	        untradeableMakerCount += 1;
-	        const currentHolding = holdingsByAssetId.get(asset_id) || null;
-	        const currentQty = Math.max(0, toNumber(currentHolding?.quantity, 0));
-	        const missingQty = Math.max(0, quantity - currentQty);
-	        if (missingQty > 0 && currentPrice !== null) {
-	          extraCashFromUntradeable += missingQty * currentPrice;
-	        }
-	        continue;
-	      }
+        if (buyBlocked && quantity > currentQty) {
+          const blockedQty = roundToDecimals(quantity - currentQty, 6) ?? 0;
+          if (blockedQty > 0 && currentPrice !== null) {
+            const blockedNotional = blockedQty * currentPrice;
+            blockedCashAdjustment += blockedNotional;
+            if (permanentlyBlocked) {
+              blockedUntradeableAssetIds.add(asset_id);
+              blockedUntradeableBuyNotional += blockedNotional;
+            } else {
+              blockedIlliquidBuyAssetIds.add(asset_id);
+              blockedIlliquidBuyNotional += blockedNotional;
+            }
+          }
+          quantity = currentQty;
+          preserveCurrentHolding = currentQty > 0;
+        }
+
+        if (sellBlocked && currentQty > quantity) {
+          const blockedQty = roundToDecimals(currentQty - quantity, 6) ?? 0;
+          if (blockedQty > 0 && currentPrice !== null) {
+            const blockedNotional = blockedQty * currentPrice;
+            blockedCashAdjustment -= blockedNotional;
+            if (permanentlyBlocked) {
+              blockedUntradeableAssetIds.add(asset_id);
+              blockedUntradeableSellNotional += blockedNotional;
+            } else {
+              blockedIlliquidSellAssetIds.add(asset_id);
+              blockedIlliquidSellNotional += blockedNotional;
+            }
+          }
+          quantity = currentQty;
+          preserveCurrentHolding = currentQty > 0;
+        }
+
+        quantity = roundToDecimals(quantity, 6) ?? 0;
+        if (!quantity || quantity <= 0) {
+          continue;
+        }
 
 	      const symbol = `PM:${String(market || '').slice(0, 10)}:${outcome || 'OUTCOME'}`;
-	      nextStocks.push({
-	        symbol,
-	        market,
-	        asset_id,
-	        outcome,
-	        avgCost: avgCost !== null ? avgCost : currentPrice,
-	        quantity,
-	        currentPrice,
-	        orderID: `poly-size-${String(asset_id || '').slice(-10)}`,
-	      });
+        if (preserveCurrentHolding && currentHolding) {
+          nextStocks.push({
+            symbol:
+              String(currentHolding?.symbol || '').trim() ||
+              symbol,
+            market: currentHolding?.market ? String(currentHolding.market) : market,
+            asset_id,
+            outcome: currentHolding?.outcome ? String(currentHolding.outcome) : outcome,
+            avgCost:
+              toNumber(currentHolding?.avgCost, null) ??
+              (avgCost !== null ? avgCost : currentPrice),
+            quantity,
+            currentPrice:
+              toNumber(currentHolding?.currentPrice, null) ??
+              currentPrice,
+            orderID:
+              currentHolding?.orderID
+                ? String(currentHolding.orderID)
+                : `${permanentlyBlocked ? 'poly-untradeable' : 'poly-illiquid'}-${String(asset_id || '').slice(-10)}`,
+          });
+        } else {
+	        nextStocks.push({
+	          symbol,
+	          market,
+	          asset_id,
+	          outcome,
+	          avgCost: avgCost !== null ? avgCost : currentPrice,
+	          quantity,
+	          currentPrice,
+	          orderID: `poly-size-${String(asset_id || '').slice(-10)}`,
+	        });
+        }
 	      targetAssetIds.add(asset_id);
 	    }
 
-	    // Keep already-held untradeable positions in the target so we don't repeatedly try to trade them.
+	    // Keep already-held blocked positions in the target so we don't repeatedly try to trade them.
 	    for (const [assetId, currentHolding] of holdingsByAssetId.entries()) {
-	      if (!untradeableTokenIds.has(assetId) || targetAssetIds.has(assetId)) {
+        const permanentlyBlocked = untradeableTokenIds.has(assetId);
+        const liquidityBlock = getLiquidityBlockState(assetId);
+        const blockedFromSelling = permanentlyBlocked || liquidityBlock.sellBlocked;
+	      if (!blockedFromSelling || targetAssetIds.has(assetId)) {
 	        continue;
 	      }
 	      const quantity = roundToDecimals(Math.max(0, toNumber(currentHolding?.quantity, 0)), 6) ?? 0;
@@ -2952,6 +3150,17 @@ const syncPolymarketPortfolioInternal = async (portfolio, options = {}) => {
 	      const symbol =
 	        String(currentHolding?.symbol || '').trim() ||
 	        (market ? `PM:${String(market).slice(0, 10)}:${outcome || 'OUTCOME'}` : `PM:${String(assetId).slice(0, 10)}`);
+        if (currentPrice !== null) {
+          const blockedNotional = quantity * currentPrice;
+          blockedCashAdjustment -= blockedNotional;
+          if (permanentlyBlocked) {
+            blockedUntradeableAssetIds.add(assetId);
+            blockedUntradeableSellNotional += blockedNotional;
+          } else {
+            blockedIlliquidSellAssetIds.add(assetId);
+            blockedIlliquidSellNotional += blockedNotional;
+          }
+        }
 	      nextStocks.push({
 	        symbol,
 	        market,
@@ -2960,20 +3169,33 @@ const syncPolymarketPortfolioInternal = async (portfolio, options = {}) => {
 	        avgCost: avgCost !== null ? avgCost : currentPrice,
 	        quantity,
 	        currentPrice,
-	        orderID: currentHolding?.orderID ? String(currentHolding.orderID) : `poly-untradeable-${String(assetId).slice(-10)}`,
+	        orderID:
+            currentHolding?.orderID
+              ? String(currentHolding.orderID)
+              : `${permanentlyBlocked ? 'poly-untradeable' : 'poly-illiquid'}-${String(assetId).slice(-10)}`,
 	      });
 	      targetAssetIds.add(assetId);
 	    }
 
 	    updatedStocks = nextStocks;
-	    if (extraCashFromUntradeable > 0) {
-	      cash = roundToDecimals(cash + extraCashFromUntradeable, 6) ?? cash;
-	      sizingMeta = {
-	        ...sizingMeta,
-	        untradeableMakerCount,
-	        untradeableCash: roundToDecimals(extraCashFromUntradeable, 6),
-	      };
-	    }
+      cash = Math.max(0, roundToDecimals(cash + blockedCashAdjustment, 6) ?? cash);
+      if (
+        blockedUntradeableAssetIds.size ||
+        blockedIlliquidBuyAssetIds.size ||
+        blockedIlliquidSellAssetIds.size
+      ) {
+        sizingMeta = {
+          ...sizingMeta,
+          untradeableMakerCount: blockedUntradeableAssetIds.size,
+          untradeableBuyNotional: roundToDecimals(blockedUntradeableBuyNotional, 6),
+          untradeableSellNotional: roundToDecimals(blockedUntradeableSellNotional, 6),
+          illiquidBuyCount: blockedIlliquidBuyAssetIds.size,
+          illiquidSellCount: blockedIlliquidSellAssetIds.size,
+          illiquidBuyNotional: roundToDecimals(blockedIlliquidBuyNotional, 6),
+          illiquidSellNotional: roundToDecimals(blockedIlliquidSellNotional, 6),
+          blockedTradeCashAdjustment: roundToDecimals(blockedCashAdjustment, 6),
+        };
+      }
 
 	    portfolio.polymarket = {
 	      ...snapshotPolymarket(portfolio.polymarket),
@@ -3597,6 +3819,11 @@ const syncPolymarketPortfolioInternal = async (portfolio, options = {}) => {
 	                : order.side === 'SELL'
 	                  ? 'no bids in orderbook'
 	                  : 'no liquidity';
+              noteLiquidityBlock({
+                tokenId: order.assetId,
+                side: order.side,
+                reason: error,
+              });
 	            applySkippedOrderToTarget({
 	              order,
 	              amount,
@@ -3621,6 +3848,11 @@ const syncPolymarketPortfolioInternal = async (portfolio, options = {}) => {
 	            } catch (priceError) {
 	              const msg = String(priceError?.message || priceError || 'no match');
 	              const diagnostics = buildRebalanceDiagnostics({ orderbook });
+                noteLiquidityBlock({
+                  tokenId: order.assetId,
+                  side: order.side,
+                  reason: msg,
+                });
 	              applySkippedOrderToTarget({
 	                order,
                 amount,
@@ -3748,6 +3980,11 @@ const syncPolymarketPortfolioInternal = async (portfolio, options = {}) => {
                   : order.side === 'SELL'
                     ? 'no bids in orderbook'
                     : errorMessage;
+              noteLiquidityBlock({
+                tokenId: order.assetId,
+                side: order.side,
+                reason: liquidityError,
+              });
               applySkippedOrderToTarget({
                 order,
                 amount,
@@ -3759,6 +3996,11 @@ const syncPolymarketPortfolioInternal = async (portfolio, options = {}) => {
             }
 
             if (noMatchDetected) {
+              noteLiquidityBlock({
+                tokenId: order.assetId,
+                side: order.side,
+                reason: errorMessage,
+              });
               applySkippedOrderToTarget({
                 order,
                 amount,
@@ -3935,12 +4177,38 @@ const syncPolymarketPortfolioInternal = async (portfolio, options = {}) => {
 	    trimmed.forEach((id) => untradeableTokenIds.add(id));
 	    untradeableTokenIdsDirty = true;
 	  }
+    pruneLiquidityBlocks(now.getTime());
+    if (liquidityBlocks.size > MAX_LIQUIDITY_BLOCKS) {
+      const trimmed = Array.from(liquidityBlocks.values())
+        .sort((a, b) => (a?.updatedAtMs || 0) - (b?.updatedAtMs || 0))
+        .slice(-MAX_LIQUIDITY_BLOCKS);
+      liquidityBlocks.clear();
+      trimmed.forEach((entry) => {
+        if (!entry?.asset_id) {
+          return;
+        }
+        liquidityBlocks.set(entry.asset_id, entry);
+      });
+      liquidityBlocksDirty = true;
+    }
 	  if (untradeableTokenIdsDirty) {
 	    portfolio.polymarket = {
 	      ...snapshotPolymarket(portfolio.polymarket),
 	      untradeableTokenIds: Array.from(untradeableTokenIds),
 	    };
 	  }
+    if (liquidityBlocksDirty) {
+      portfolio.polymarket = {
+        ...snapshotPolymarket(portfolio.polymarket),
+        liquidityBlocks: Array.from(liquidityBlocks.values()).map((entry) => ({
+          asset_id: entry.asset_id,
+          buyBlockedUntil: entry.buyBlockedUntilMs ? new Date(entry.buyBlockedUntilMs).toISOString() : null,
+          sellBlockedUntil: entry.sellBlockedUntilMs ? new Date(entry.sellBlockedUntilMs).toISOString() : null,
+          reason: entry.reason || null,
+          updatedAt: entry.updatedAtMs ? new Date(entry.updatedAtMs).toISOString() : null,
+        })),
+      };
+    }
 
 	  sanitizePolymarketSubdoc(portfolio);
 	  await portfolio.save();

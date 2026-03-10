@@ -28,6 +28,7 @@ import SettingsModal from "./SettingsModal";
 import Axios from "axios";
 import { styled } from "@mui/material/styles";
 import config from "../../config/Config";
+import { logError } from "../../utils/logger";
 
 const drawerWidth = 240;
 
@@ -106,19 +107,28 @@ const PageTemplate = ({ initialPage = "dashboard", initialStrategyId = null, ini
       return;
     }
 
-    const url = config.base_url + `/api/stock/${userId}`;
-    const headers = {
-      "x-auth-token": token,
-    };
+    try {
+      const url = config.base_url + `/api/stock/${userId}`;
+      const headers = {
+        "x-auth-token": token,
+      };
 
-    const response = await Axios.get(url, {
-      headers,
-    });
+      const response = await Axios.get(url, {
+        headers,
+      });
 
-    if (response.data.status === "success") {
-      setPurchasedStocks(response.data.stocks);
-      // console.log("response.data.stocks ", response.data.stocks);
-      setAccountBalance(response.data.cash);
+      if (response.data.status === "success") {
+        setPurchasedStocks(response.data.stocks);
+        setAccountBalance(response.data.cash);
+        return;
+      }
+
+      setPurchasedStocks([]);
+      setAccountBalance(0);
+    } catch (error) {
+      logError("Error fetching page-template stocks:", error);
+      setPurchasedStocks([]);
+      setAccountBalance(0);
     }
   }, [token, userId]);
 

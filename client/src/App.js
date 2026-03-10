@@ -95,43 +95,51 @@ function App() {
 
   useEffect(() => {
     const checkLoggedIn = async () => {
-      let token = localStorage.getItem("auth-token");
-      if (token == null) {
-        localStorage.setItem("auth-token", "");
-        token = "";
-        localStorage.removeItem("user");
-        setUserData({ token: undefined, user: undefined, ALPACA_API_KEY_ID: undefined, ALPACA_API_SECRET_KEY: undefined });
-        return;
-      }
-
-      const headers = {
-        "x-auth-token": token,
-      };
-
-      const tokenIsValid = await Axios.post(
-        config.base_url + "/api/auth/validate",
-        null,
-        {
-          headers,
+      try {
+        let token = localStorage.getItem("auth-token");
+        if (token == null) {
+          localStorage.setItem("auth-token", "");
+          token = "";
+          localStorage.removeItem("user");
+          setUserData({ token: undefined, user: undefined, ALPACA_API_KEY_ID: undefined, ALPACA_API_SECRET_KEY: undefined });
+          return;
         }
-      );
 
-      if (tokenIsValid.data) {
-        const userRes = await Axios.get(config.base_url + "/api/auth/user", {
-          headers,
-        });
-        
-        setUserData({
-          token,
-          user: userRes.data,
-        });
+        const headers = {
+          "x-auth-token": token,
+        };
 
-        // Store user data in local storage
-        localStorage.setItem("user", JSON.stringify(userRes.data));
-      } else {
+        const tokenIsValid = await Axios.post(
+          config.base_url + "/api/auth/validate",
+          null,
+          {
+            headers,
+          }
+        );
+
+        if (tokenIsValid.data) {
+          const userRes = await Axios.get(config.base_url + "/api/auth/user", {
+            headers,
+          });
+          
+          setUserData({
+            token,
+            user: userRes.data,
+          });
+
+          // Store user data in local storage
+          localStorage.setItem("user", JSON.stringify(userRes.data));
+        } else {
+          localStorage.removeItem("user");
+          localStorage.setItem("auth-token", "");
+          setUserData({ token: undefined, user: undefined, ALPACA_API_KEY_ID: undefined, ALPACA_API_SECRET_KEY: undefined });
+        }
+      } catch (error) {
         localStorage.removeItem("user");
         localStorage.setItem("auth-token", "");
         setUserData({ token: undefined, user: undefined, ALPACA_API_KEY_ID: undefined, ALPACA_API_SECRET_KEY: undefined });
+        // eslint-disable-next-line no-console
+        console.error("[Auth] Failed to restore login session:", error);
       }
     };
 

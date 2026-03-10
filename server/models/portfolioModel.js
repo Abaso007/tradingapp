@@ -210,6 +210,38 @@ const portfolioSchema = new Schema({
       type: [String],
       default: [],
     },
+    liquidityBlocks: {
+      type: [
+        {
+          asset_id: {
+            type: String,
+            default: null,
+            trim: true,
+          },
+          buyBlockedUntil: {
+            type: String,
+            default: null,
+            trim: true,
+          },
+          sellBlockedUntil: {
+            type: String,
+            default: null,
+            trim: true,
+          },
+          reason: {
+            type: String,
+            default: null,
+            trim: true,
+          },
+          updatedAt: {
+            type: String,
+            default: null,
+            trim: true,
+          },
+        },
+      ],
+      default: [],
+    },
     sizingState: {
       makerCash: {
         type: Number,

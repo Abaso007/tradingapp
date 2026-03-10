@@ -67,6 +67,7 @@ const hasPolymarketMetadata = (portfolio) => {
 
   return (
     hasMeaningfulValue(polymarket.untradeableTokenIds) ||
+    hasMeaningfulValue(polymarket.liquidityBlocks) ||
     hasMeaningfulValue(polymarket.sizing) ||
     hasMeaningfulValue(polymarket.sizingState)
   );
