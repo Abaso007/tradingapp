@@ -2323,6 +2323,7 @@ exports.createPolymarketCopyTrader = async (req, res) => {
       nextRebalanceAt: computeNextRebalanceAt(normalizedRecurrence, now),
       budget: cashLimit,
       cashLimit: cashLimit,
+      currentValue: 0,
       rebalanceCount: 0,
       pnlValue: 0,
       pnlPercent: 0,
@@ -4248,6 +4249,8 @@ exports.getPortfolios = async (req, res) => {
               pnlPercent: 1,
               budget: 1,
               cashLimit: 1,
+              'stocks.quantity': 1,
+              'stocks.currentPrice': 1,
               rebalanceCount: 1,
               'polymarket.address': 1,
               'polymarket.executionMode': 1,
@@ -4371,7 +4374,22 @@ exports.getPortfolios = async (req, res) => {
           provider === 'polymarket' && portfolio?.polymarket?.sizingState && typeof portfolio.polymarket.sizingState === 'object'
             ? portfolio.polymarket.sizingState
             : {};
-        const liteCurrentValue = toNumber(portfolio.currentValue, null);
+        const liteCurrentValue = (() => {
+          const stored = toNumber(portfolio.currentValue, null);
+          if (stored !== null) {
+            return stored;
+          }
+          const stocks = Array.isArray(portfolio.stocks) ? portfolio.stocks : [];
+          const fallback = stocks.reduce((sum, stock) => {
+            const quantity = toNumber(stock?.quantity, null);
+            const currentPrice = toNumber(stock?.currentPrice, null);
+            if (quantity === null || currentPrice === null) {
+              return sum;
+            }
+            return sum + (quantity * currentPrice);
+          }, 0);
+          return stocks.length ? roundToTwo(fallback) : null;
+        })();
         const liteInitialInvestment = toNumber(portfolio.initialInvestment, 0);
         const litePnlValue = portfolio.pnlValue !== undefined && portfolio.pnlValue !== null
           ? toNumber(portfolio.pnlValue, null)
@@ -5164,6 +5182,7 @@ exports.addPortfolio = async (strategyinput, strategyName, orders, UserID, optio
         alpaca: { executionMode: portfolioExecutionMode },
         budget: toNumber(limitValue, null),
         cashLimit: toNumber(limitValue, null),
+        currentValue: null,
         rebalanceCount: 0,
         pnlValue: 0,
         pnlPercent: 0,
@@ -5344,6 +5363,7 @@ exports.addPortfolio = async (strategyinput, strategyName, orders, UserID, optio
       alpaca: { executionMode: portfolioExecutionMode },
       budget: toNumber(limitValue, null),
       cashLimit: toNumber(limitValue, null),
+      currentValue: roundToTwo(totalInvested),
       rebalanceCount: 0,
       pnlValue: 0,
       pnlPercent: 0,

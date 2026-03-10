@@ -1538,6 +1538,7 @@ const rebalancePortfolio = async (portfolio) => {
   })();
   const cashBuffer = retainedProfits;
   let strategyCash = Math.max(0, cashBuffer);
+  const startingStrategyCash = strategyCash;
   const cashLimit = toNumber(portfolio.cashLimit, toNumber(portfolio.budget, null));
   const baseLimit = cashLimit && cashLimit > 0
     ? cashLimit
@@ -2041,6 +2042,9 @@ const rebalancePortfolio = async (portfolio) => {
     ? (totalPnlValue / portfolio.initialInvestment) * 100
     : 0;
   const normalizedPnlPercent = roundToTwo(totalPnlPercent);
+  portfolio.currentValue = Number.isFinite(totalMarketValue)
+    ? roundToTwo(Math.max(0, totalMarketValue))
+    : null;
   portfolio.pnlValue = totalPnlValue !== null ? totalPnlValue : 0;
   portfolio.pnlPercent = normalizedPnlPercent !== null ? normalizedPnlPercent : 0;
   portfolio.lastPerformanceComputedAt = now;
@@ -2095,7 +2099,8 @@ const rebalancePortfolio = async (portfolio) => {
     adjustments: decisionTrace,
     reconciliation,
     cashSummary: {
-      startingCash: roundToTwo(accountCash),
+      startingCash: roundToTwo(startingStrategyCash),
+      accountCash: roundToTwo(accountCash),
       sellProceeds: roundToTwo(sellProceeds),
       spentOnBuys: roundToTwo(buySpend),
       endingCash: roundToTwo(availableCash),
@@ -2104,7 +2109,7 @@ const rebalancePortfolio = async (portfolio) => {
   };
   const holdDecisions = decisionTrace.filter((entry) => entry.action === 'hold');
 
-  const updatedRetainedCash = roundToTwo(Math.max(0, toNumber(portfolio.retainedCash, 0) + realizedPnlDelta));
+  const updatedRetainedCash = roundToTwo(Math.max(0, strategyCash));
   portfolio.retainedCash = updatedRetainedCash !== null ? updatedRetainedCash : 0;
   portfolio.cashBuffer = portfolio.retainedCash;
   thoughtProcess.cashSummary.cashBuffer = roundToTwo(portfolio.cashBuffer);
@@ -2133,7 +2138,7 @@ const rebalancePortfolio = async (portfolio) => {
     holds: holdDecisions,
     reconciliation,
     cashSummary: {
-      startingCash: accountCash,
+      startingCash: startingStrategyCash,
       sellProceeds,
       spentOnBuys: buySpend,
       endingCash: availableCash,

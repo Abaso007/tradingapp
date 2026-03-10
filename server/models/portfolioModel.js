@@ -300,6 +300,10 @@ const portfolioSchema = new Schema({
     required: false,
     default: null,
   },
+  currentValue: {
+    type: Number,
+    default: null,
+  },
   rebalanceCount: {
     type: Number,
     default: 0,
