@@ -1619,9 +1619,10 @@ jest.mock('../strategyLogger', () => ({
     const sizingSetPath = Object.keys(sizingPlan.stages[0].set)[0];
     expect(stocksSetPath).toBe('stocks.$[stocks0]');
     expect(stocksPlan.stages[0].arrayFilters).toEqual([{ 'stocks0.asset_id': 'asset-1' }]);
-    expect(sizingSetPath).toMatch(/^polymarket\.sizingState\.holdings\.\$\[[a-zA-Z0-9_]+0\]$/);
-    const sizingAlias = sizingSetPath.match(/\$\[([a-zA-Z0-9_]+)\]/)?.[1];
+    expect(sizingSetPath).toMatch(/^polymarket\.sizingState\.holdings\.\$\[[a-zA-Z0-9]+0\]$/);
+    const sizingAlias = sizingSetPath.match(/\$\[([a-zA-Z0-9]+)\]/)?.[1];
     expect(sizingAlias).toBeTruthy();
+    expect(sizingAlias).toMatch(/^[a-z][a-zA-Z0-9]*$/);
     expect(sizingAlias).not.toBe('stocks0');
     expect(sizingPlan.stages[0].arrayFilters).toEqual([{ [`${sizingAlias}.asset_id`]: 'asset-1' }]);
   });

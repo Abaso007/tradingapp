@@ -524,11 +524,27 @@ const collectMongoFieldDiff = (path, before, after, updateDoc) => {
   addUpdateSet(updateDoc, path, after);
 };
 const MAX_TARGETED_ARRAY_ROW_UPDATES = 50;
-const buildArrayFilterAliasPrefix = (path) =>
-  String(path || 'row')
-    .replace(/[^a-zA-Z0-9]+/g, '_')
-    .replace(/^_+|_+$/g, '')
-    .slice(0, 24) || 'row';
+const buildArrayFilterAliasPrefix = (path) => {
+  const segments = String(path || 'row')
+    .split(/[^a-zA-Z0-9]+/)
+    .map((segment) => segment.trim())
+    .filter(Boolean);
+  const camel = segments
+    .map((segment, index) => {
+      const safe = segment.replace(/[^a-zA-Z0-9]/g, '');
+      if (!safe) {
+        return '';
+      }
+      if (index === 0) {
+        return safe.charAt(0).toLowerCase() + safe.slice(1);
+      }
+      return safe.charAt(0).toUpperCase() + safe.slice(1);
+    })
+    .join('')
+    .replace(/[^a-zA-Z0-9]/g, '');
+  const normalized = /^[a-z]/.test(camel) ? camel : `r${camel || 'row'}`;
+  return normalized.slice(0, 24) || 'row';
+};
 const buildKeyedArrayUpdatePlan = ({
   path,
   previous,
