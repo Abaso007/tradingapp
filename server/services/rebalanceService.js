@@ -2253,7 +2253,7 @@ const REBALANCE_LOCK_TIMEOUT_MS = (() => {
 
 const REBALANCE_MAX_CONCURRENCY = (() => {
   const raw = Number(process.env.REBALANCE_MAX_CONCURRENCY);
-  if (!Number.isFinite(raw) || raw <= 0) return 4;
+  if (!Number.isFinite(raw) || raw <= 0) return 2;
   return Math.max(1, Math.min(Math.floor(raw), 32));
 })();
 
