@@ -55,6 +55,51 @@ const loadPortfolioFilter = () => {
   return "all";
 };
 
+const normalizeExecutionMode = (value) => {
+  const normalized = String(value || "").trim().toLowerCase();
+  if (normalized === "live" || normalized === "real") {
+    return "live";
+  }
+  if (
+    normalized === "paper" ||
+    normalized === "dry" ||
+    normalized === "dry-run" ||
+    normalized === "dryrun"
+  ) {
+    return "paper";
+  }
+  return null;
+};
+
+const derivePortfolioRealMoneyState = (portfolio) => {
+  const provider = String(portfolio?.provider || "alpaca").toLowerCase();
+  if (provider === "polymarket") {
+    const requestedExecutionMode =
+      normalizeExecutionMode(portfolio?.polymarket?.executionMode) ||
+      normalizeExecutionMode(portfolio?.polymarket?.requestedExecutionMode);
+    const effectiveExecutionMode =
+      normalizeExecutionMode(portfolio?.polymarket?.effectiveExecutionMode) ||
+      (requestedExecutionMode === "live" && portfolio?.isRealMoney ? "live" : null);
+
+    return {
+      isRealMoneyRequested: Boolean(portfolio?.isRealMoneyRequested) || requestedExecutionMode === "live",
+      isRealMoney: Boolean(portfolio?.isRealMoney) || effectiveExecutionMode === "live",
+    };
+  }
+
+  const requestedExecutionMode =
+    normalizeExecutionMode(portfolio?.alpaca?.executionMode) ||
+    normalizeExecutionMode(portfolio?.alpaca?.requestedExecutionMode);
+  const effectiveExecutionMode =
+    normalizeExecutionMode(portfolio?.alpaca?.effectiveExecutionMode) ||
+    (requestedExecutionMode === "live" && portfolio?.isRealMoney ? "live" : null);
+
+  return {
+    isRealMoneyRequested: Boolean(portfolio?.isRealMoneyRequested) || requestedExecutionMode === "live",
+    isRealMoney: Boolean(portfolio?.isRealMoney) || effectiveExecutionMode === "live",
+  };
+};
+
 const Portfolios = ({ portfolios, onViewStrategyLogs, refreshPortfolios }) => {
   const navigate = useNavigate();
   const [saleOpen, setSaleOpen] = useState(false);
@@ -939,7 +984,15 @@ const deleteStrategy = async (strategyId) => {
     return date.toLocaleString();
   };
 
-  const normalizedPortfolios = Array.isArray(portfolios) ? portfolios.map(normalizePortfolioProvider) : [];
+  const normalizedPortfolios = Array.isArray(portfolios)
+    ? portfolios.map((portfolio) => {
+        const normalized = normalizePortfolioProvider(portfolio);
+        return {
+          ...normalized,
+          ...derivePortfolioRealMoneyState(normalized),
+        };
+      })
+    : [];
   const polymarketPortfolios = normalizedPortfolios.filter((portfolio) => {
     return String(portfolio?.provider || "").toLowerCase() === "polymarket";
   });

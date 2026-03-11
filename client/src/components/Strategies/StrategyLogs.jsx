@@ -27,12 +27,12 @@ const StrategyLogs = ({ strategyId, strategyName, onClose = () => {} }) => {
       setError(null);
 
       try {
-        const url = `${config.base_url}/api/strategies/logs/${userId}/${strategyId}`;
+        const url = `${config.base_url}/api/strategies/logs/${userId}/${strategyId}?compact=1&limit=100`;
         const headers = {
           "x-auth-token": token,
         };
 
-        const response = await Axios.get(url, { headers });
+        const response = await Axios.get(url, { headers, timeout: 15000 });
 
         if (!isMounted) {
           return;

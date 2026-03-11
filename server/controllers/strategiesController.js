@@ -46,6 +46,7 @@ const {
   completeProgress,
 } = require('../utils/progressBus');
 const { getPortfolioProvider } = require('../utils/portfolioProvider');
+const { compactStrategyLogDetails } = require('../utils/strategyLogResponse');
 	const { fetchComposerLinkSnapshot, fetchPublicSymphonyBacktestById, parseSymphonyIdFromUrl } = require('../utils/composerLinkClient');
 	const { computeComposerHoldingsWeights } = require('../utils/composerHoldingsWeights');
 	const { compareComposerStrategySemantics } = require('../utils/composerStrategySemantics');
@@ -145,6 +146,48 @@ const roundToTwo = (value) => {
     return null;
   }
   return Math.round((value + Number.EPSILON) * 100) / 100;
+};
+
+const normalizeStrategyExecutionMode = (value) => {
+  const normalized = String(value || '').trim().toLowerCase();
+  if (normalized === 'live' || normalized === 'real') {
+    return 'live';
+  }
+  if (
+    normalized === 'paper' ||
+    normalized === 'dry' ||
+    normalized === 'dry-run' ||
+    normalized === 'dryrun'
+  ) {
+    return 'paper';
+  }
+  return null;
+};
+
+const getPolymarketRequestedExecutionMode = (portfolio) => {
+  return (
+    normalizeStrategyExecutionMode(portfolio?.polymarket?.executionMode) ||
+    normalizeStrategyExecutionMode(portfolio?.polymarket?.requestedExecutionMode) ||
+    'paper'
+  );
+};
+
+const getPolymarketEffectiveExecutionMode = (portfolio, envExecutionMode) => {
+  return (
+    normalizeStrategyExecutionMode(portfolio?.polymarket?.effectiveExecutionMode) ||
+    (envExecutionMode === 'live' ? getPolymarketRequestedExecutionMode(portfolio) : 'paper')
+  );
+};
+
+const getPolymarketRealMoneyFlags = (portfolio, envExecutionMode) => {
+  const requestedExecutionMode = getPolymarketRequestedExecutionMode(portfolio);
+  const effectiveExecutionMode = getPolymarketEffectiveExecutionMode(portfolio, envExecutionMode);
+  return {
+    requestedExecutionMode,
+    effectiveExecutionMode,
+    isRealMoneyRequested: requestedExecutionMode === 'live',
+    isRealMoney: effectiveExecutionMode === 'live',
+  };
 };
 
 const mapDecisionRationales = (decisions = []) => {
@@ -2514,17 +2557,39 @@ exports.getStrategyLogs = async (req, res) => {
       });
     }
 
+    const limitParam = Number(req.query?.limit);
+    const limit = Number.isFinite(limitParam)
+      ? Math.min(100, Math.max(1, Math.floor(limitParam)))
+      : 100;
+    const compact = String(req.query?.compact ?? '1') !== '0';
+
     const logs = await StrategyLog.find({
       strategy_id: strategyId,
       userId: String(userId),
     })
       .sort({ createdAt: -1 })
-      .limit(200)
+      .limit(limit)
       .lean();
+
+    const responseLogs = compact
+      ? logs.map((log) => ({
+          _id: log?._id,
+          strategy_id: log?.strategy_id,
+          strategyName: log?.strategyName ?? null,
+          level: log?.level ?? null,
+          message: log?.message ?? null,
+          createdAt: log?.createdAt ?? null,
+          details: compactStrategyLogDetails(log?.details, {
+            maxTradeItems: 100,
+            maxPositionItems: 40,
+            maxSkippedItems: 25,
+          }),
+        }))
+      : logs;
 
     return res.status(200).json({
       status: 'success',
-      logs,
+      logs: responseLogs,
     });
   } catch (error) {
     console.error('Error fetching strategy logs:', error.message);
@@ -4254,6 +4319,8 @@ exports.getPortfolios = async (req, res) => {
               rebalanceCount: 1,
               'polymarket.address': 1,
               'polymarket.executionMode': 1,
+              'polymarket.requestedExecutionMode': 1,
+              'polymarket.effectiveExecutionMode': 1,
               'polymarket.sizeToBudget': 1,
               'polymarket.seedFromPositions': 1,
               'polymarket.backfillPending': 1,
@@ -4360,12 +4427,17 @@ exports.getPortfolios = async (req, res) => {
             : envAlpacaExecutionMode === 'live'
               ? alpacaRequestedExecutionMode
               : 'paper';
-        const polymarketRequestedExecutionMode =
+        const polymarketRealMoneyFlags =
           provider === 'polymarket'
-            ? (portfolio?.polymarket?.executionMode
-              ? String(portfolio.polymarket.executionMode).trim().toLowerCase()
-              : 'paper')
-            : 'paper';
+            ? getPolymarketRealMoneyFlags(portfolio, envExecutionMode)
+            : {
+                requestedExecutionMode: 'paper',
+                effectiveExecutionMode: 'paper',
+                isRealMoneyRequested: false,
+                isRealMoney: false,
+              };
+        const polymarketRequestedExecutionMode = polymarketRealMoneyFlags.requestedExecutionMode;
+        const polymarketEffectiveExecutionMode = polymarketRealMoneyFlags.effectiveExecutionMode;
         const polymarketMakerAddress =
           provider === 'polymarket' && portfolio?.polymarket?.address
             ? String(portfolio.polymarket.address).trim()
@@ -4439,11 +4511,7 @@ exports.getPortfolios = async (req, res) => {
                 envExecutionMode,
                 executionMode: polymarketRequestedExecutionMode,
                 requestedExecutionMode: polymarketRequestedExecutionMode,
-                effectiveExecutionMode: envExecutionMode === 'live'
-                  ? (portfolio?.polymarket?.executionMode
-                    ? String(portfolio.polymarket.executionMode).trim().toLowerCase()
-                    : 'paper')
-                  : 'paper',
+                effectiveExecutionMode: polymarketEffectiveExecutionMode,
                 makerAddress: polymarketMakerAddress,
                 sizeToBudget: Boolean(portfolio?.polymarket?.sizeToBudget),
                 seedFromPositions: Boolean(portfolio?.polymarket?.seedFromPositions),
@@ -4469,15 +4537,12 @@ exports.getPortfolios = async (req, res) => {
                 effectiveExecutionMode: alpacaEffectiveExecutionMode,
               },
           isRealMoney:
-            (provider === 'polymarket' &&
-              envExecutionMode === 'live' &&
-              String(portfolio?.polymarket?.executionMode || '').trim().toLowerCase() === 'live') ||
+            (provider === 'polymarket' && polymarketRealMoneyFlags.isRealMoney) ||
             (provider !== 'polymarket' &&
               envAlpacaExecutionMode === 'live' &&
               alpacaRequestedExecutionMode === 'live'),
           isRealMoneyRequested:
-            (provider === 'polymarket' &&
-              String(portfolio?.polymarket?.executionMode || '').trim().toLowerCase() === 'live') ||
+            (provider === 'polymarket' && polymarketRealMoneyFlags.isRealMoneyRequested) ||
             (provider !== 'polymarket' && alpacaRequestedExecutionMode === 'live'),
         };
       });
@@ -4977,12 +5042,17 @@ exports.getPortfolios = async (req, res) => {
           ? storedPnlPercent
           : (initialInvestment > 0 ? (pnlValue / initialInvestment) * 100 : null);
 
-      const polymarketRequestedExecutionMode =
+      const polymarketRealMoneyFlags =
         provider === 'polymarket'
-          ? (portfolio?.polymarket?.executionMode
-            ? String(portfolio.polymarket.executionMode).trim().toLowerCase()
-            : 'paper')
-          : 'paper';
+          ? getPolymarketRealMoneyFlags(portfolio, envExecutionMode)
+          : {
+              requestedExecutionMode: 'paper',
+              effectiveExecutionMode: 'paper',
+              isRealMoneyRequested: false,
+              isRealMoney: false,
+            };
+      const polymarketRequestedExecutionMode = polymarketRealMoneyFlags.requestedExecutionMode;
+      const polymarketEffectiveExecutionMode = polymarketRealMoneyFlags.effectiveExecutionMode;
 
       const polymarketMakerAddress =
         provider === 'polymarket' && portfolio?.polymarket?.address
@@ -5033,11 +5103,7 @@ exports.getPortfolios = async (req, res) => {
               envExecutionMode,
               executionMode: polymarketRequestedExecutionMode,
               requestedExecutionMode: polymarketRequestedExecutionMode,
-              effectiveExecutionMode: envExecutionMode === 'live'
-                ? (portfolio?.polymarket?.executionMode
-                  ? String(portfolio.polymarket.executionMode).trim().toLowerCase()
-                  : 'paper')
-                : 'paper',
+              effectiveExecutionMode: polymarketEffectiveExecutionMode,
               makerAddress: polymarketMakerAddress,
               sizeToBudget: Boolean(portfolio?.polymarket?.sizeToBudget),
               seedFromPositions: Boolean(portfolio?.polymarket?.seedFromPositions),
@@ -5063,15 +5129,12 @@ exports.getPortfolios = async (req, res) => {
               effectiveExecutionMode: alpacaEffectiveExecutionMode,
             },
         isRealMoney:
-          (provider === 'polymarket' &&
-            envExecutionMode === 'live' &&
-            String(portfolio?.polymarket?.executionMode || '').trim().toLowerCase() === 'live') ||
+          (provider === 'polymarket' && polymarketRealMoneyFlags.isRealMoney) ||
           (provider !== 'polymarket' &&
             envAlpacaExecutionMode === 'live' &&
             alpacaRequestedExecutionMode === 'live'),
         isRealMoneyRequested:
-          (provider === 'polymarket' &&
-            String(portfolio?.polymarket?.executionMode || '').trim().toLowerCase() === 'live') ||
+          (provider === 'polymarket' && polymarketRealMoneyFlags.isRealMoneyRequested) ||
           (provider !== 'polymarket' && alpacaRequestedExecutionMode === 'live'),
       };
     });

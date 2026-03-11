@@ -101,6 +101,12 @@ const PageTemplate = ({ initialPage = "dashboard", initialStrategyId = null, ini
 
   //Function to get the list of purchased stocks from the server using Alpacas API
   const getPurchasedStocks = useCallback(async () => {
+    if (isStrategyLogsRoute || isLiveLogsRoute) {
+      setPurchasedStocks([]);
+      setAccountBalance(0);
+      return;
+    }
+
     if (!token || !userId) {
       setPurchasedStocks([]);
       setAccountBalance(0);
@@ -130,7 +136,7 @@ const PageTemplate = ({ initialPage = "dashboard", initialStrategyId = null, ini
       setPurchasedStocks([]);
       setAccountBalance(0);
     }
-  }, [token, userId]);
+  }, [isStrategyLogsRoute, isLiveLogsRoute, token, userId]);
 
 
   useEffect(() => {
