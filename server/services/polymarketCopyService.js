@@ -4,6 +4,7 @@ const CryptoJS = require('crypto-js');
 const mongoose = require('mongoose');
 const { normalizeRecurrence, computeNextRebalanceAt } = require('../utils/recurrence');
 const { recordStrategyLog } = require('./strategyLogger');
+const Portfolio = require('../models/portfolioModel');
 const StrategyEquitySnapshot = require('../models/strategyEquitySnapshotModel');
   const {
   getPolymarketExecutionMode,
@@ -357,6 +358,59 @@ const snapshotPolymarket = (poly) => {
     delete base.sizingState;
   }
   return base;
+};
+const toPlainMongoValue = (value) => {
+  if (value === undefined) {
+    return undefined;
+  }
+  if (value === null || typeof value !== 'object') {
+    return value;
+  }
+  if (value instanceof Date) {
+    return value;
+  }
+  if (Array.isArray(value)) {
+    return value
+      .map((entry) => toPlainMongoValue(entry))
+      .filter((entry) => entry !== undefined);
+  }
+  const source = typeof value.toObject === 'function' ? value.toObject() : value;
+  const next = {};
+  Object.entries(source).forEach(([key, entry]) => {
+    const normalized = toPlainMongoValue(entry);
+    if (normalized !== undefined) {
+      next[key] = normalized;
+    }
+  });
+  return next;
+};
+const persistPolymarketPortfolioState = async (
+  portfolio,
+  { includeStocks = true, includePolymarket = true } = {}
+) => {
+  if (!portfolio?._id) {
+    await portfolio.save();
+    return;
+  }
+  const updateSet = {
+    lastRebalancedAt: portfolio.lastRebalancedAt ?? null,
+    nextRebalanceAt: portfolio.nextRebalanceAt ?? null,
+    rebalanceCount: toNumber(portfolio.rebalanceCount, 0) ?? 0,
+    lastPerformanceComputedAt: portfolio.lastPerformanceComputedAt ?? null,
+    retainedCash: toNumber(portfolio.retainedCash, 0) ?? 0,
+    cashBuffer: toNumber(portfolio.cashBuffer, 0) ?? 0,
+  };
+  if (includePolymarket) {
+    sanitizePolymarketSubdoc(portfolio);
+    updateSet.polymarket = toPlainMongoValue(snapshotPolymarket(portfolio.polymarket));
+  }
+  if (includeStocks) {
+    updateSet.stocks = toPlainMongoValue(Array.isArray(portfolio.stocks) ? portfolio.stocks : []);
+  }
+  await Portfolio.updateOne(
+    { _id: portfolio._id },
+    { $set: updateSet }
+  );
 };
 
 const axiosGet = async (url, config = {}) => {
@@ -2304,9 +2358,11 @@ const syncPolymarketPortfolioInternal = async (portfolio, options = {}) => {
     portfolio.rebalanceCount = toNumber(portfolio.rebalanceCount, 0) + 1;
     portfolio.lastPerformanceComputedAt = now;
     ensureStockOrderIds(currentHoldings);
-    sanitizePolymarketSubdoc(portfolio);
     const savePortfolioStartedAtMs = Date.now();
-    await portfolio.save();
+    await persistPolymarketPortfolioState(portfolio, {
+      includeStocks: true,
+      includePolymarket: false,
+    });
     notePhaseTiming('savePortfolio', savePortfolioStartedAtMs, {
       positionsCount: currentHoldings.length,
     });
@@ -4677,10 +4733,11 @@ const syncPolymarketPortfolioInternal = async (portfolio, options = {}) => {
       delete nextPoly.pendingLiveRebalance;
       portfolio.polymarket = nextPoly;
     }
-
-	  sanitizePolymarketSubdoc(portfolio);
     const savePortfolioStartedAtMs = Date.now();
-	  await portfolio.save();
+    await persistPolymarketPortfolioState(portfolio, {
+      includeStocks: shouldApplyPortfolioUpdate || liveHoldings.reconciledPortfolio === true,
+      includePolymarket: true,
+    });
     notePhaseTiming('savePortfolio', savePortfolioStartedAtMs, {
       positionsCount: Array.isArray(portfolio.stocks) ? portfolio.stocks.length : 0,
       portfolioUpdated: shouldApplyPortfolioUpdate,
