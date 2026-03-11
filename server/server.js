@@ -135,10 +135,25 @@ mongoose.connection.on('disconnecting', () => logConnectionState('Event: disconn
 const app = express();
 const port = process.env.PORT || 3000;
 const bindHost = String(process.env.BIND_HOST || '').trim() || '0.0.0.0';
+const resolveTrustProxySetting = (value) => {
+  const raw = String(value ?? '1').trim();
+  const normalized = raw.toLowerCase();
+  if (!raw || raw === '1' || normalized === 'true' || normalized === 'yes' || normalized === 'on') {
+    return 1;
+  }
+  if (raw === '0' || normalized === 'false' || normalized === 'no' || normalized === 'off') {
+    return false;
+  }
+  const numeric = Number(raw);
+  if (Number.isInteger(numeric) && numeric >= 0) {
+    return numeric === 0 ? false : numeric;
+  }
+  return raw;
+};
 
 app.disable('x-powered-by');
 // If behind a reverse proxy (Nginx/DO LB), trust `X-Forwarded-For` so IP-based rate limits work.
-app.set('trust proxy', String(process.env.TRUST_PROXY || '1') === '1');
+app.set('trust proxy', resolveTrustProxySetting(process.env.TRUST_PROXY));
 
 const normalizeEnvValue = (value) => String(value || '').trim();
 let clobProxyPoolKey = null;
