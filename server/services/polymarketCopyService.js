@@ -887,9 +887,46 @@ const POLYMARKET_MARKET_CACHE_MAX_ENTRIES = (() => {
   }
   return Math.max(50, Math.min(Math.floor(raw), 50_000));
 })();
+const POLYMARKET_MARKET_PREFETCH_CONCURRENCY = (() => {
+  const raw = Number(process.env.POLYMARKET_MARKET_PREFETCH_CONCURRENCY);
+  if (!Number.isFinite(raw) || raw <= 0) {
+    return 12;
+  }
+  return Math.max(1, Math.min(Math.floor(raw), 64));
+})();
 
 const marketCacheByConditionId = new Map();
 const marketCacheInFlight = new Map();
+const prefetchMarkets = async (conditionIds, ensureMarket) => {
+  if (typeof ensureMarket !== 'function') {
+    return;
+  }
+  const uniqueConditionIds = Array.from(
+    new Set(
+      (Array.isArray(conditionIds) ? conditionIds : [])
+        .map((value) => String(value || '').trim())
+        .filter(Boolean)
+    )
+  );
+  if (!uniqueConditionIds.length) {
+    return;
+  }
+
+  let cursor = 0;
+  const workerCount = Math.max(1, Math.min(POLYMARKET_MARKET_PREFETCH_CONCURRENCY, uniqueConditionIds.length));
+  await Promise.all(
+    Array.from({ length: workerCount }, async () => {
+      while (true) {
+        const index = cursor;
+        cursor += 1;
+        if (index >= uniqueConditionIds.length) {
+          return;
+        }
+        await ensureMarket(uniqueConditionIds[index]);
+      }
+    })
+  );
+};
 const fetchMarketCached = async (conditionId) => {
   const key = String(conditionId || '').trim();
   if (!key) {
@@ -1728,6 +1765,10 @@ const syncPolymarketPortfolioInternal = async (portfolio, options = {}) => {
         return null;
       }
     };
+    await prefetchMarkets(
+      stocks.map((entry) => (entry?.market ? String(entry.market) : null)),
+      ensureMarket
+    );
 
     for (const entry of stocks) {
       const conditionId = entry?.market ? String(entry.market) : null;
@@ -3256,6 +3297,11 @@ const syncPolymarketPortfolioInternal = async (portfolio, options = {}) => {
       return false;
     }
 
+    await prefetchMarkets(
+      Array.from(makerHoldingsByAssetId.values()).map((entry) => (entry?.market ? String(entry.market) : null)),
+      ensureMarket
+    );
+
     // Refresh current prices for maker holdings.
     for (const [assetId, entry] of makerHoldingsByAssetId.entries()) {
       const conditionId = entry?.market ? String(entry.market) : null;
@@ -3533,6 +3579,10 @@ const syncPolymarketPortfolioInternal = async (portfolio, options = {}) => {
 
   if (!didSize) {
     const buildTargetPortfolioStartedAtMs = Date.now();
+    await prefetchMarkets(
+      Array.from(holdingsByAssetId.values()).map((entry) => (entry?.market ? String(entry.market) : null)),
+      ensureMarket
+    );
     // Refresh current prices using market snapshots when possible.
     for (const [assetId, entry] of holdingsByAssetId.entries()) {
       const conditionId = entry?.market ? String(entry.market) : null;
