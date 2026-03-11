@@ -467,6 +467,21 @@ const addUpdateSet = (updateDoc, path, value) => {
 const addUpdateUnset = (updateDoc, path) => {
   ensureUpdateOperatorBucket(updateDoc, '$unset')[path] = 1;
 };
+const normalizeComparableStockEntry = (entry) => ({
+  asset_id: entry?.asset_id ? String(entry.asset_id) : null,
+  market: entry?.market ? String(entry.market) : null,
+  outcome: entry?.outcome ? String(entry.outcome) : null,
+  orderID: entry?.orderID ? String(entry.orderID) : null,
+  quantity: roundToDecimals(toNumber(entry?.quantity, null), 6),
+  avgCost: roundToDecimals(toNumber(entry?.avgCost, null), 6),
+});
+const normalizeComparableSizingHolding = (entry) => ({
+  asset_id: entry?.asset_id ? String(entry.asset_id) : null,
+  market: entry?.market ? String(entry.market) : null,
+  outcome: entry?.outcome ? String(entry.outcome) : null,
+  quantity: roundToDecimals(toNumber(entry?.quantity, null), 6),
+  avgCost: roundToDecimals(toNumber(entry?.avgCost, null), 6),
+});
 const clonePolymarketWithoutSizingHoldings = (poly) => {
   if (!isPlainMongoObject(poly)) {
     return poly;
@@ -514,6 +529,7 @@ const buildKeyedArrayUpdatePlan = ({
   previous,
   next,
   keyField,
+  compareEntry = areMongoValuesEqual,
 }) => {
   const previousArray = Array.isArray(previous) ? previous.map((entry) => toPlainMongoValue(entry)) : [];
   const nextArray = Array.isArray(next) ? next.map((entry) => toPlainMongoValue(entry)) : [];
@@ -525,9 +541,6 @@ const buildKeyedArrayUpdatePlan = ({
     addedCount: 0,
     removedCount: 0,
   };
-  if (areMongoValuesEqual(previousArray, nextArray)) {
-    return { stats: baseStats };
-  }
   const previousMap = new Map();
   const nextMap = new Map();
   const collectRows = (entries, target) => {
@@ -567,7 +580,7 @@ const buildKeyedArrayUpdatePlan = ({
       removedKeys.push(key);
       continue;
     }
-    if (!areMongoValuesEqual(previousEntry, nextEntry)) {
+    if (!compareEntry(previousEntry, nextEntry)) {
       changedEntries.push(
         previousEntry?._id !== undefined && nextEntry?._id === undefined
           ? { ...nextEntry, _id: previousEntry._id }
@@ -729,6 +742,8 @@ const persistPolymarketPortfolioState = async (
       previous: previousStocks,
       next: Array.isArray(portfolio.stocks) ? portfolio.stocks : [],
       keyField: 'asset_id',
+      compareEntry: (left, right) =>
+        areMongoValuesEqual(normalizeComparableStockEntry(left), normalizeComparableStockEntry(right)),
     });
     applyUpdatePlan(updateDoc, updateOptions, stocksPlan);
     stats.stocksMode = stocksPlan?.stats?.mode || 'unchanged';
@@ -751,6 +766,8 @@ const persistPolymarketPortfolioState = async (
       previous: previousPoly?.sizingState?.holdings,
       next: nextPoly?.sizingState?.holdings,
       keyField: 'asset_id',
+      compareEntry: (left, right) =>
+        areMongoValuesEqual(normalizeComparableSizingHolding(left), normalizeComparableSizingHolding(right)),
     });
     applyUpdatePlan(updateDoc, updateOptions, sizingHoldingsPlan);
     stats.sizingHoldingsMode = sizingHoldingsPlan?.stats?.mode || 'unchanged';

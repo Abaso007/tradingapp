@@ -1518,7 +1518,18 @@ jest.mock('../strategyLogger', () => ({
     dataApi
       .get('/trades')
       .query(true)
-      .reply(200, []);
+      .reply(200, [
+        {
+          transactionHash: '0x1111',
+          asset: 'asset-1',
+          conditionId: 'cond-1',
+          outcome: 'Yes',
+          side: 'SELL',
+          timestamp: 1700000001,
+          price: 0.6,
+          size: 1,
+        },
+      ]);
 
     const clob = nock('https://clob.polymarket.com');
     clob.get('/markets/cond-1').query(true).reply(200, {
@@ -1562,12 +1573,12 @@ jest.mock('../strategyLogger', () => ({
         address: '0x3333333333333333333333333333333333333333',
         backfillPending: false,
         lastTradeMatchTime: '1970-01-01T00:00:00.000Z',
-        lastTradeId: 'legacy-clob-id',
+        lastTradeId: null,
       },
     };
 
     const result = await syncPolymarketPortfolio(portfolio, { mode: 'incremental' });
-    expect(result.processed).toBe(0);
+    expect(result.processed).toBe(1);
     expect(portfolio.save).not.toHaveBeenCalled();
     expect(updateOne).toHaveBeenCalledTimes(1);
 
@@ -1575,7 +1586,8 @@ jest.mock('../strategyLogger', () => ({
     expect(update.$set['stocks.$[row0]']).toBeTruthy();
     expect(update.$set['stocks.$[row0]']._id).toEqual(stockSubdocId);
     expect(update.$set['stocks.$[row0]']._id).not.toEqual({});
-    expect(update.$set['polymarket.lastTradeId']).toBeNull();
+    expect(update.$set['stocks.$[row0]'].quantity).toBeCloseTo(1, 6);
+    expect(update.$set['polymarket.lastTradeId']).toContain('data-api:0x1111:');
     expect(update.$set.polymarket).toBeUndefined();
     expect(updateOne.mock.calls[0][2]?.arrayFilters).toEqual([{ 'row0.asset_id': 'asset-1' }]);
   });
