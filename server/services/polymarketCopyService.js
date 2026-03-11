@@ -1131,6 +1131,99 @@ const syncPolymarketPortfolioInternal = async (portfolio, options = {}) => {
 
   const poly = portfolio.polymarket || {};
   const requestedMode = String(options?.mode || '').trim().toLowerCase();
+  const shouldLogSyncTiming = process.env.NODE_ENV !== 'test';
+  const syncStartedAtMs = Date.now();
+  const phaseTimings = new Map();
+  const roundTimingMs = (value) => {
+    const num = Number(value);
+    if (!Number.isFinite(num) || num <= 0) {
+      return 0;
+    }
+    return Math.round(num);
+  };
+  const formatTimingDuration = (value) => {
+    const ms = roundTimingMs(value);
+    if (ms >= 60000) {
+      return `${(ms / 60000).toFixed(1)}m`;
+    }
+    if (ms >= 10000) {
+      return `${Math.round(ms / 1000)}s`;
+    }
+    if (ms >= 1000) {
+      return `${(ms / 1000).toFixed(1)}s`;
+    }
+    return `${ms}ms`;
+  };
+  const notePhaseTiming = (phase, startedAtMs, meta = null) => {
+    const key = String(phase || '').trim();
+    if (!key || !Number.isFinite(startedAtMs)) {
+      return 0;
+    }
+    const elapsedMs = roundTimingMs(Date.now() - startedAtMs);
+    const existing = phaseTimings.get(key) || {
+      totalMs: 0,
+      calls: 0,
+      maxMs: 0,
+      meta: null,
+    };
+    existing.totalMs += elapsedMs;
+    existing.calls += 1;
+    existing.maxMs = Math.max(existing.maxMs, elapsedMs);
+    if (meta && typeof meta === 'object') {
+      existing.meta = { ...(existing.meta || {}), ...meta };
+    }
+    phaseTimings.set(key, existing);
+    return elapsedMs;
+  };
+  const buildTimingSummary = () => ({
+    totalMs: roundTimingMs(Date.now() - syncStartedAtMs),
+    phases: Array.from(phaseTimings.entries())
+      .sort(([, left], [, right]) => right.totalMs - left.totalMs)
+      .map(([phase, entry]) => ({
+        phase,
+        totalMs: roundTimingMs(entry.totalMs),
+        calls: entry.calls,
+        maxMs: roundTimingMs(entry.maxMs),
+        ...(entry.meta ? { meta: entry.meta } : {}),
+      })),
+  });
+  const buildTimingSummaryLine = (timings) => {
+    const summary = timings && typeof timings === 'object' ? timings : null;
+    if (!summary || !Array.isArray(summary.phases)) {
+      return null;
+    }
+    const topPhases = summary.phases
+      .filter((entry) => Number(entry?.totalMs) > 0)
+      .slice(0, 4)
+      .map((entry) => `${entry.phase} ${formatTimingDuration(entry.totalMs)}`);
+    if (!topPhases.length && Number(summary.totalMs || 0) <= 0) {
+      return null;
+    }
+    return `• Timing: total ${formatTimingDuration(summary.totalMs)}${topPhases.length ? ` · ${topPhases.join(' · ')}` : ''}.`;
+  };
+  const finalizeSyncResult = (result, timings = buildTimingSummary()) => {
+    const timingSummary = timings && typeof timings === 'object' ? timings : buildTimingSummary();
+    if (shouldLogSyncTiming) {
+      console.log('[Polymarket Sync Timing]', {
+        portfolioId: portfolio?._id ? String(portfolio._id) : null,
+        strategyId: portfolio?.strategy_id ? String(portfolio.strategy_id) : null,
+        mode: result?.mode ?? null,
+        tradeSource: result?.tradeSource ?? null,
+        processed: result?.processed ?? null,
+        buys: result?.buys ?? null,
+        sells: result?.sells ?? null,
+        skipped: result?.skipped ?? null,
+        waitingForTrades: result?.waitingForTrades ?? null,
+        pagesFetched: result?.pagesFetched ?? null,
+        totalMs: timingSummary.totalMs,
+        topPhases: Array.isArray(timingSummary.phases) ? timingSummary.phases.slice(0, 5) : [],
+      });
+    }
+    return {
+      ...(result || {}),
+      timings: timingSummary,
+    };
+  };
 
   const MAX_UNTRADEABLE_TOKEN_IDS = 200;
   const untradeableTokenIds = new Set(
@@ -1515,6 +1608,8 @@ const syncPolymarketPortfolioInternal = async (portfolio, options = {}) => {
 	  let autoRedeem = null;
 	  const autoRedeemEnabled = parseBoolean(process.env.POLYMARKET_AUTO_REDEEM, false);
 	  if (autoRedeemEnabled && executionMode === 'live' && mode === 'incremental') {
+      const autoRedeemStartedAtMs = Date.now();
+      try {
 	    const userAddress = funderAddressCandidate || authAddress;
 	    if (userAddress && isValidHexAddress(userAddress) && typeof redeemPolymarketWinnings === 'function') {
 	      try {
@@ -1557,6 +1652,18 @@ const syncPolymarketPortfolioInternal = async (portfolio, options = {}) => {
 	    } else {
 	      autoRedeem = { ok: false, skipped: true, reason: 'missing_execution_wallet' };
 	    }
+      } finally {
+        const submitted = Boolean(
+          autoRedeem?.walletType &&
+            (autoRedeem?.txHash || (Array.isArray(autoRedeem?.txHashes) && autoRedeem.txHashes.length > 0))
+        );
+        notePhaseTiming('autoRedeem', autoRedeemStartedAtMs, {
+          enabled: true,
+          ok: autoRedeem?.ok ?? null,
+          submitted,
+          skipped: autoRedeem?.skipped === true,
+        });
+      }
 	  }
 
 	  const recordEquitySnapshotIfPossible = async ({ stocks, retainedCash } = {}) => {
@@ -1976,6 +2083,22 @@ const syncPolymarketPortfolioInternal = async (portfolio, options = {}) => {
 
     return { pendingTrades, pagesFetched };
   };
+  const runCollectTrades = async (tradeSource, meta = null) => {
+    let collected = null;
+    const collectTradesStartedAtMs = Date.now();
+    try {
+      collected = await collectTrades(tradeSource);
+      return collected;
+    } finally {
+      notePhaseTiming('collectTrades', collectTradesStartedAtMs, {
+        tradeSource,
+        pagesFetched: collected?.pagesFetched ?? null,
+        tradesCollected: Array.isArray(collected?.pendingTrades) ? collected.pendingTrades.length : null,
+        ok: Boolean(collected),
+        ...(meta && typeof meta === 'object' ? meta : {}),
+      });
+    }
+  };
 
   const initialTradeSource = (() => {
     if (tradesSourceSetting === 'auto' && getClobCooldownMessage()) {
@@ -2012,7 +2135,7 @@ const syncPolymarketPortfolioInternal = async (portfolio, options = {}) => {
         },
       });
     }
-    const collected = await collectTrades(tradeSourceUsed);
+    const collected = await runCollectTrades(tradeSourceUsed, { fallback: false });
     pendingTrades = collected.pendingTrades;
     pagesFetched = collected.pagesFetched;
   } catch (error) {
@@ -2064,7 +2187,7 @@ const syncPolymarketPortfolioInternal = async (portfolio, options = {}) => {
           },
         });
       }
-      const collected = await collectTrades(tradeSourceUsed);
+      const collected = await runCollectTrades(tradeSourceUsed, { fallback: true });
       pendingTrades = collected.pendingTrades;
       pagesFetched = collected.pagesFetched;
     } else {
@@ -2130,19 +2253,37 @@ const syncPolymarketPortfolioInternal = async (portfolio, options = {}) => {
       });
     }
     const currentHoldings = Array.isArray(portfolio.stocks) ? portfolio.stocks : [];
+    const refreshHoldingsStartedAtMs = Date.now();
     await refreshHoldingsPrices(currentHoldings);
+    notePhaseTiming('refreshHoldingsPrices', refreshHoldingsStartedAtMs, {
+      positionsCount: currentHoldings.length,
+    });
     portfolio.lastRebalancedAt = now;
     portfolio.nextRebalanceAt = computeNextRebalanceAt(normalizeRecurrence(portfolio.recurrence), now);
     portfolio.rebalanceCount = toNumber(portfolio.rebalanceCount, 0) + 1;
     portfolio.lastPerformanceComputedAt = now;
     ensureStockOrderIds(currentHoldings);
     sanitizePolymarketSubdoc(portfolio);
+    const savePortfolioStartedAtMs = Date.now();
     await portfolio.save();
+    notePhaseTiming('savePortfolio', savePortfolioStartedAtMs, {
+      positionsCount: currentHoldings.length,
+    });
+    const recordEquityStartedAtMs = Date.now();
     await recordEquitySnapshotIfPossible({
       stocks: currentHoldings,
       retainedCash: portfolio.retainedCash,
     });
-    return { processed: 0, mode, waitingForTrades: mode === 'incremental' ? !lastTradeId : false };
+    notePhaseTiming('recordEquitySnapshot', recordEquityStartedAtMs, {
+      positionsCount: currentHoldings.length,
+    });
+    return finalizeSyncResult({
+      processed: 0,
+      mode,
+      tradeSource: tradeSourceUsed,
+      pagesFetched,
+      waitingForTrades: mode === 'incremental' ? !lastTradeId : false,
+    });
   }
 
   const processedTrades = pendingTrades.slice().reverse();
@@ -2211,6 +2352,8 @@ const syncPolymarketPortfolioInternal = async (portfolio, options = {}) => {
   liveHoldings.shouldFetch = shouldFetchLiveHoldings;
 
   if (shouldFetchLiveHoldings) {
+    const liveHoldingsStartedAtMs = Date.now();
+    try {
     const userAddress = funderAddressCandidate || authAddress;
     if (!userAddress || !isValidHexAddress(userAddress)) {
       liveHoldings.error =
@@ -2291,6 +2434,15 @@ const syncPolymarketPortfolioInternal = async (portfolio, options = {}) => {
       } catch (error) {
         liveHoldings.error = formatAxiosError(error);
       }
+    }
+    } finally {
+      notePhaseTiming('liveHoldingsSync', liveHoldingsStartedAtMs, {
+        shouldFetch: true,
+        used: liveHoldingsUsed,
+        positionsCount: liveHoldings.positionsCount,
+        reconciledPortfolio: liveHoldings.reconciledPortfolio,
+        errored: Boolean(liveHoldings.error),
+      });
     }
   }
 
@@ -2386,6 +2538,8 @@ const syncPolymarketPortfolioInternal = async (portfolio, options = {}) => {
   };
 
   if (makerStateEnabled && !makerStateAvailable && seedFromPositions && mode === 'incremental') {
+    const seedSnapshotStartedAtMs = Date.now();
+    try {
     const sizingBudget = (() => {
       const cashLimit = pickNumber(portfolio.cashLimit);
       if (cashLimit !== null) {
@@ -2453,6 +2607,14 @@ const syncPolymarketPortfolioInternal = async (portfolio, options = {}) => {
         error: formatAxiosError(error),
       };
       tradeScale = null;
+    }
+    } finally {
+      notePhaseTiming('seedMakerState', seedSnapshotStartedAtMs, {
+        seededFromPositionsSnapshot,
+        makerStateAvailable,
+        positionsCount: sizingMeta?.positionsCount ?? null,
+        errored: Boolean(sizingMeta?.error),
+      });
     }
   }
   const marketCache = new Map();
@@ -2597,6 +2759,7 @@ const syncPolymarketPortfolioInternal = async (portfolio, options = {}) => {
     return Number.isFinite(remainingMs) && remainingMs > 0 ? Date.now() + remainingMs : null;
   };
 
+  const processTradesStartedAtMs = Date.now();
   if (seededFromPositionsSnapshot) {
     ignoredTradesCount = processedTrades.length;
     if (processedTrades.length) {
@@ -3077,6 +3240,12 @@ const syncPolymarketPortfolioInternal = async (portfolio, options = {}) => {
       processedCount += 1;
     }
   }
+  notePhaseTiming('processTrades', processTradesStartedAtMs, {
+    inputTrades: processedTrades.length,
+    processedTrades: processedCount,
+    ignoredTrades: ignoredTradesCount,
+    liveExecutionAbort: Boolean(liveExecutionAbort),
+  });
 
   let updatedStocks = [];
   let rebalancePlan = null;
@@ -3354,9 +3523,16 @@ const syncPolymarketPortfolioInternal = async (portfolio, options = {}) => {
     return true;
   };
 
+  const applySizingStartedAtMs = Date.now();
   const didSize = await applySizing();
+  notePhaseTiming('applySizing', applySizingStartedAtMs, {
+    didSize,
+    makerStateEnabled,
+    makerStateAvailable,
+  });
 
   if (!didSize) {
+    const buildTargetPortfolioStartedAtMs = Date.now();
     // Refresh current prices using market snapshots when possible.
     for (const [assetId, entry] of holdingsByAssetId.entries()) {
       const conditionId = entry?.market ? String(entry.market) : null;
@@ -3395,9 +3571,14 @@ const syncPolymarketPortfolioInternal = async (portfolio, options = {}) => {
         orderID: entry.orderID ? String(entry.orderID) : `poly-${String(entry.asset_id || '').slice(-10)}`,
       }))
       .filter((row) => row.quantity > 0);
+    notePhaseTiming('buildTargetPortfolio', buildTargetPortfolioStartedAtMs, {
+      positionsCount: updatedStocks.length,
+    });
   }
 
   const executeSizeToBudgetRebalance = async () => {
+    const liveRebalanceStartedAtMs = Date.now();
+    try {
 	    rebalancePlan = {
 	      minNotional: POLYMARKET_LIVE_REBALANCE_MIN_NOTIONAL,
 	      maxOrders: POLYMARKET_LIVE_REBALANCE_MAX_ORDERS,
@@ -3433,6 +3614,8 @@ const syncPolymarketPortfolioInternal = async (portfolio, options = {}) => {
     }
 
     if (liveRebalancePreflightEnabled) {
+      const liveRebalancePreflightStartedAtMs = Date.now();
+      try {
       const preflight = {
         ok: false,
         primary: null,
@@ -3511,6 +3694,12 @@ const syncPolymarketPortfolioInternal = async (portfolio, options = {}) => {
       }
 
       executionPreflight = preflight;
+      } finally {
+        notePhaseTiming('liveRebalancePreflight', liveRebalancePreflightStartedAtMs, {
+          ok: executionPreflight?.ok ?? null,
+          primary: executionPreflight?.primary ?? null,
+        });
+      }
     }
 
     const clobCooldownMessageAfterPreflight = getClobCooldownMessage();
@@ -3660,6 +3849,7 @@ const syncPolymarketPortfolioInternal = async (portfolio, options = {}) => {
 	      if (orderbookCache.has(key)) {
 	        return orderbookCache.get(key);
 	      }
+	      const fetchOrderbookStartedAtMs = Date.now();
 	      let orderbook = null;
 	      try {
 	        const orderbookResponse = await polymarketAxiosGet(`${CLOB_HOST}/book`, {
@@ -3696,6 +3886,11 @@ const syncPolymarketPortfolioInternal = async (portfolio, options = {}) => {
         }
 
 	      orderbookCache.set(key, orderbook);
+        notePhaseTiming('liveRebalanceFetchOrderbook', fetchOrderbookStartedAtMs, {
+          assetId: key,
+          ok: orderbook?.ok === true,
+          status: orderbook?.status ?? null,
+        });
 	      return orderbook;
 	    };
 
@@ -3888,7 +4083,11 @@ const syncPolymarketPortfolioInternal = async (portfolio, options = {}) => {
         }
       }
 
+      const prefetchOrderbooksStartedAtMs = Date.now();
       await prefetchClobOrderbooks();
+      notePhaseTiming('liveRebalancePrefetchOrderbooks', prefetchOrderbooksStartedAtMs, {
+        plannedOrders: orders.length,
+      });
 
 		    for (const order of orders) {
 		      const amount = order.side === 'BUY'
@@ -4007,6 +4206,7 @@ const syncPolymarketPortfolioInternal = async (portfolio, options = {}) => {
 	      }
 
 			      let execution = null;
+            let liveOrderExecutionStartedAtMs = null;
 			      try {
             const clobCooldownMessage = getClobCooldownMessage();
             if (clobCooldownMessage) {
@@ -4032,6 +4232,7 @@ const syncPolymarketPortfolioInternal = async (portfolio, options = {}) => {
               break;
             }
 			        rebalancePlan.attemptedOrders += 1;
+              liveOrderExecutionStartedAtMs = Date.now();
 			        execution = await executePolymarketMarketOrder({
 			          tokenID: order.assetId,
 			          side: order.side,
@@ -4189,7 +4390,14 @@ const syncPolymarketPortfolioInternal = async (portfolio, options = {}) => {
 		          rebalancePlan.failedOrders += 1;
 	          continue;
 	        }
-	      }
+	      } finally {
+            if (liveOrderExecutionStartedAtMs !== null) {
+              notePhaseTiming('liveRebalanceExecuteOrder', liveOrderExecutionStartedAtMs, {
+                assetId: order.assetId,
+                side: order.side,
+              });
+            }
+          }
 
 	      const meta = extractOrderMeta(execution);
 	      const statusCode = (() => {
@@ -4258,6 +4466,15 @@ const syncPolymarketPortfolioInternal = async (portfolio, options = {}) => {
 
     if (!rebalancePlan.reason) {
       rebalancePlan.reason = 'orders_planned';
+    }
+    } finally {
+      notePhaseTiming('liveRebalance', liveRebalanceStartedAtMs, {
+        reason: rebalancePlan?.reason ?? null,
+        attemptedOrders: rebalancePlan?.attemptedOrders ?? 0,
+        successfulOrders: rebalancePlan?.successfulOrders ?? 0,
+        failedOrders: rebalancePlan?.failedOrders ?? 0,
+        skippedOrders: rebalancePlan?.skippedOrders ?? 0,
+      });
     }
   };
 
@@ -4412,13 +4629,22 @@ const syncPolymarketPortfolioInternal = async (portfolio, options = {}) => {
     }
 
 	  sanitizePolymarketSubdoc(portfolio);
+    const savePortfolioStartedAtMs = Date.now();
 	  await portfolio.save();
+    notePhaseTiming('savePortfolio', savePortfolioStartedAtMs, {
+      positionsCount: Array.isArray(portfolio.stocks) ? portfolio.stocks.length : 0,
+      portfolioUpdated: shouldApplyPortfolioUpdate,
+    });
 
   const savedStocks = Array.isArray(portfolio.stocks) ? portfolio.stocks : [];
 
+  const recordEquityStartedAtMs = Date.now();
   await recordEquitySnapshotIfPossible({
     stocks: savedStocks,
     retainedCash: portfolio.retainedCash,
+  });
+  notePhaseTiming('recordEquitySnapshot', recordEquityStartedAtMs, {
+    positionsCount: savedStocks.length,
   });
 
 	  const maxLogTrades = mode === 'backfill' ? 200 : 500;
@@ -4433,6 +4659,7 @@ const syncPolymarketPortfolioInternal = async (portfolio, options = {}) => {
     });
     const positionsTrimmed = Math.max(0, savedStocks.length - Math.min(savedStocks.length, maxLogPositions));
     const targetPositionsTrimmed = Math.max(0, updatedStocks.length - Math.min(updatedStocks.length, maxLogPositions));
+    const timingSummary = buildTimingSummary();
 	  const summaryMessage = mode === 'backfill'
 	    ? 'Polymarket copy-trader backfilled'
 	    : liveExecutionAbort
@@ -4560,6 +4787,10 @@ const syncPolymarketPortfolioInternal = async (portfolio, options = {}) => {
     } else if (shouldApplyPortfolioUpdate === false) {
       lines.push('• Portfolio updated: no.');
     }
+    const timingSummaryLine = buildTimingSummaryLine(timingSummary);
+    if (timingSummaryLine) {
+      lines.push(timingSummaryLine);
+    }
 
     return lines.join('\n');
   })();
@@ -4636,6 +4867,7 @@ const syncPolymarketPortfolioInternal = async (portfolio, options = {}) => {
               retryingStoredLiveRebalance: shouldRetryStoredLiveRebalance,
               pendingLiveRebalance: pendingLiveRebalanceState,
 	            autoRedeem,
+              timings: timingSummary,
 	            executionDebug,
 	            liveHoldings,
 	            holdingsSource: liveHoldingsUsed ? 'data-api' : 'portfolio',
@@ -4663,7 +4895,7 @@ const syncPolymarketPortfolioInternal = async (portfolio, options = {}) => {
     },
   });
 
-	  return {
+	  return finalizeSyncResult({
 	    processed: processedCount,
 	    mode,
 	    tradeSource: tradeSourceUsed,
@@ -4671,7 +4903,7 @@ const syncPolymarketPortfolioInternal = async (portfolio, options = {}) => {
 	    buys: tradeSummary.buys.length,
 	    sells: tradeSummary.sells.length,
 	    skipped: tradeSummary.skipped.length,
-	  };
+	  }, timingSummary);
 };
 
 const polymarketSyncInFlight = new Map();

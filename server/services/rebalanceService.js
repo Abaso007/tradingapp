@@ -2301,9 +2301,10 @@ const runDueRebalances = async () => {
 
       let processed = 0;
       let cursor = 0;
+      const shouldLogPortfolioRuns = process.env.NODE_ENV !== 'test';
       const workerCount = Math.max(1, Math.min(REBALANCE_MAX_CONCURRENCY, duePortfolios.length));
       await Promise.all(
-        Array.from({ length: workerCount }, async () => {
+        Array.from({ length: workerCount }, async (_, workerIndex) => {
           while (true) {
             const index = cursor;
             cursor += 1;
@@ -2311,17 +2312,60 @@ const runDueRebalances = async () => {
               return;
             }
             const portfolio = duePortfolios[index];
+            const provider = String(portfolio.provider || 'alpaca');
+            const portfolioId = portfolio?._id ? String(portfolio._id) : null;
+            const strategyId = portfolio?.strategy_id ? String(portfolio.strategy_id) : null;
+            const portfolioStartedAtMs = Date.now();
+            if (shouldLogPortfolioRuns) {
+              console.log('[Rebalance] Starting portfolio run:', {
+                worker: workerIndex + 1,
+                queueIndex: index + 1,
+                dueTotal: duePortfolios.length,
+                portfolioId,
+                strategyId,
+                provider,
+              });
+            }
             try {
-              const provider = String(portfolio.provider || 'alpaca');
+              let result = null;
               if (provider === 'polymarket') {
-                await syncPolymarketPortfolio(portfolio, { skipIfLocked: true });
+                result = await syncPolymarketPortfolio(portfolio, { skipIfLocked: true });
               } else {
-                await rebalancePortfolio(portfolio);
+                result = await rebalancePortfolio(portfolio);
               }
               processed += 1;
+              if (shouldLogPortfolioRuns) {
+                console.log('[Rebalance] Completed portfolio run:', {
+                  worker: workerIndex + 1,
+                  queueIndex: index + 1,
+                  dueTotal: duePortfolios.length,
+                  portfolioId,
+                  strategyId,
+                  provider,
+                  durationMs: Date.now() - portfolioStartedAtMs,
+                  result: provider === 'polymarket'
+                    ? {
+                        skipped: result?.skipped === true,
+                        reason: result?.reason ?? null,
+                        mode: result?.mode ?? null,
+                        processed: result?.processed ?? null,
+                        pagesFetched: result?.pagesFetched ?? null,
+                        timingMs: result?.timings?.totalMs ?? null,
+                      }
+                    : {
+                        ok: true,
+                      },
+                });
+              }
             } catch (error) {
-              console.error(`[Rebalance] Failed for portfolio ${portfolio._id}:`, error.message);
-              const provider = String(portfolio.provider || 'alpaca');
+              console.error(`[Rebalance] Failed for portfolio ${portfolio._id}:`, error.message, {
+                worker: workerIndex + 1,
+                queueIndex: index + 1,
+                dueTotal: duePortfolios.length,
+                strategyId,
+                provider,
+                durationMs: Date.now() - portfolioStartedAtMs,
+              });
               await recordStrategyLog({
                 strategyId: portfolio.strategy_id,
                 userId: portfolio.userId,
