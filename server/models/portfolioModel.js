@@ -163,6 +163,11 @@ const portfolioSchema = new Schema({
       type: Boolean,
       default: false,
     },
+    sizeToBudgetBasis: {
+      type: String,
+      default: null,
+      trim: true,
+    },
     seedFromPositions: {
       type: Boolean,
       default: false,
@@ -263,6 +268,11 @@ const portfolioSchema = new Schema({
       scale: {
         type: Number,
         default: null,
+      },
+      scaleBasis: {
+        type: String,
+        default: null,
+        trim: true,
       },
       scaleBudget: {
         type: Number,

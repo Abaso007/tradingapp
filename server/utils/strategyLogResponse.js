@@ -102,6 +102,7 @@ const compactStrategyLogDetails = (details, options = {}) => {
     'portfolioUpdated',
     'hasClobCredentials',
     'sizeToBudget',
+    'sizeToBudgetBasis',
     'sizedToBudget',
     'seedFromPositions',
     'retryingStoredLiveRebalance',
@@ -134,6 +135,8 @@ const compactStrategyLogDetails = (details, options = {}) => {
   }
 
   const sizing = pickObjectFields(details.sizing, [
+    'sizeToBudgetBasis',
+    'scaleBasis',
     'sizingBudget',
     'scale',
     'makerValue',

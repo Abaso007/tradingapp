@@ -2267,6 +2267,24 @@ exports.createPolymarketCopyTrader = async (req, res) => {
       return normalized === 'true' || normalized === '1' || normalized === 'yes';
     })();
 
+    const sizeToBudgetBasis = (() => {
+      const raw = req.body.sizeToBudgetBasis ?? req.body.sizingBasis ?? req.body.copySizingBasis;
+      const normalized = String(raw || process.env.POLYMARKET_SIZE_TO_BUDGET_BASIS || 'positions').trim().toLowerCase();
+      if (
+        normalized === 'wallet' ||
+        normalized === 'wallet-total' ||
+        normalized === 'wallet_total' ||
+        normalized === 'total-wallet' ||
+        normalized === 'total_wallet' ||
+        normalized === 'cash' ||
+        normalized === 'cash-plus-positions' ||
+        normalized === 'cash_plus_positions'
+      ) {
+        return 'wallet';
+      }
+      return 'positions';
+    })();
+
     const seedFromPositions = (() => {
       const raw = req.body.seedFromPositions ?? req.body.seedPositions ?? req.body.seedSizeToBudgetFromPositions;
       if (raw === true) {
@@ -2376,6 +2394,7 @@ exports.createPolymarketCopyTrader = async (req, res) => {
         address,
         executionMode: requestedExecutionMode,
         sizeToBudget,
+        sizeToBudgetBasis,
         seedFromPositions,
         authAddress: authAddressEnv || null,
         backfillPending: backfillRequested,
@@ -2408,6 +2427,7 @@ exports.createPolymarketCopyTrader = async (req, res) => {
 	        authAddress: authAddressEnv || null,
 	        backfill: backfillRequested,
 	        sizeToBudget,
+          sizeToBudgetBasis,
 	        seedFromPositions,
 	      },
 	    });
@@ -4409,12 +4429,14 @@ exports.getPortfolios = async (req, res) => {
               'polymarket.requestedExecutionMode': 1,
               'polymarket.effectiveExecutionMode': 1,
               'polymarket.sizeToBudget': 1,
+              'polymarket.sizeToBudgetBasis': 1,
               'polymarket.seedFromPositions': 1,
               'polymarket.backfillPending': 1,
               'polymarket.backfilledAt': 1,
               'polymarket.lastTradeMatchTime': 1,
               'polymarket.lastTradeId': 1,
               'polymarket.sizingState.scale': 1,
+              'polymarket.sizingState.scaleBasis': 1,
               'polymarket.sizingState.scaleBudget': 1,
               'polymarket.sizingState.scaleMakerValue': 1,
               'polymarket.sizingState.scaleSetAt': 1,
@@ -4601,6 +4623,9 @@ exports.getPortfolios = async (req, res) => {
                 effectiveExecutionMode: polymarketEffectiveExecutionMode,
                 makerAddress: polymarketMakerAddress,
                 sizeToBudget: Boolean(portfolio?.polymarket?.sizeToBudget),
+                sizeToBudgetBasis: portfolio?.polymarket?.sizeToBudgetBasis
+                  ? String(portfolio.polymarket.sizeToBudgetBasis)
+                  : null,
                 seedFromPositions: Boolean(portfolio?.polymarket?.seedFromPositions),
                 backfillPending: Boolean(portfolio?.polymarket?.backfillPending),
                 backfilledAt: portfolio?.polymarket?.backfilledAt ? String(portfolio.polymarket.backfilledAt) : null,
@@ -4608,6 +4633,7 @@ exports.getPortfolios = async (req, res) => {
                 lastTradeId: portfolio?.polymarket?.lastTradeId ? String(portfolio.polymarket.lastTradeId) : null,
                 sizing: {
                   scale: toNumber(polymarketSizingState?.scale, null),
+                  scaleBasis: polymarketSizingState?.scaleBasis ? String(polymarketSizingState.scaleBasis) : null,
                   scaleBudget: toNumber(polymarketSizingState?.scaleBudget, null),
                   scaleMakerValue: toNumber(polymarketSizingState?.scaleMakerValue, null),
                   scaleSetAt: polymarketSizingState?.scaleSetAt ? String(polymarketSizingState.scaleSetAt) : null,
@@ -5193,6 +5219,9 @@ exports.getPortfolios = async (req, res) => {
               effectiveExecutionMode: polymarketEffectiveExecutionMode,
               makerAddress: polymarketMakerAddress,
               sizeToBudget: Boolean(portfolio?.polymarket?.sizeToBudget),
+              sizeToBudgetBasis: portfolio?.polymarket?.sizeToBudgetBasis
+                ? String(portfolio.polymarket.sizeToBudgetBasis)
+                : null,
               seedFromPositions: Boolean(portfolio?.polymarket?.seedFromPositions),
               backfillPending: Boolean(portfolio?.polymarket?.backfillPending),
               backfilledAt: portfolio?.polymarket?.backfilledAt ? String(portfolio.polymarket.backfilledAt) : null,
@@ -5200,6 +5229,7 @@ exports.getPortfolios = async (req, res) => {
               lastTradeId: portfolio?.polymarket?.lastTradeId ? String(portfolio.polymarket.lastTradeId) : null,
               sizing: {
                 scale: toNumber(polymarketSizingState?.scale, null),
+                scaleBasis: polymarketSizingState?.scaleBasis ? String(polymarketSizingState.scaleBasis) : null,
                 scaleBudget: toNumber(polymarketSizingState?.scaleBudget, null),
                 scaleMakerValue: toNumber(polymarketSizingState?.scaleMakerValue, null),
                 scaleSetAt: polymarketSizingState?.scaleSetAt ? String(polymarketSizingState.scaleSetAt) : null,

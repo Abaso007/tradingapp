@@ -205,6 +205,37 @@ const parseBoolean = (value, fallback = false) => {
   return fallback;
 };
 
+const normalizeSizeToBudgetBasis = (value, fallback = 'positions') => {
+  const raw = String(value || '').trim().toLowerCase();
+  if (!raw) {
+    return fallback;
+  }
+  if (
+    raw === 'wallet' ||
+    raw === 'wallet-total' ||
+    raw === 'wallet_total' ||
+    raw === 'total-wallet' ||
+    raw === 'total_wallet' ||
+    raw === 'cash' ||
+    raw === 'cash-plus-positions' ||
+    raw === 'cash_plus_positions'
+  ) {
+    return 'wallet';
+  }
+  if (
+    raw === 'positions' ||
+    raw === 'position' ||
+    raw === 'positions-only' ||
+    raw === 'positions_only' ||
+    raw === 'holdings' ||
+    raw === 'holdings-only' ||
+    raw === 'holdings_only'
+  ) {
+    return 'positions';
+  }
+  return fallback;
+};
+
 const computeHoldingsMarketValue = (stocks = []) => {
   if (!Array.isArray(stocks) || !stocks.length) {
     return 0;
@@ -2161,6 +2192,10 @@ const syncPolymarketPortfolioInternal = async (portfolio, options = {}) => {
     }).catch(() => {});
   }
   const sizeToBudget = parseBoolean(poly.sizeToBudget, parseBoolean(process.env.POLYMARKET_SIZE_TO_BUDGET, false));
+  const sizeToBudgetBasis = normalizeSizeToBudgetBasis(
+    poly.sizeToBudgetBasis ?? process.env.POLYMARKET_SIZE_TO_BUDGET_BASIS,
+    'positions'
+  );
   const seedFromPositions = parseBoolean(
     poly.seedFromPositions,
     parseBoolean(process.env.POLYMARKET_SIZE_TO_BUDGET_SEED_FROM_POSITIONS, false)
@@ -2905,7 +2940,20 @@ const syncPolymarketPortfolioInternal = async (portfolio, options = {}) => {
     }).catch(() => {});
   }
 
-  if (!pendingTrades.length && !shouldSeedFromPositionsSnapshot && !shouldRetryStoredLiveRebalance) {
+  const shouldApplyIdleSizeToBudget = (() => {
+    if (mode !== 'incremental' || sizeToBudget !== true) {
+      return false;
+    }
+    const storedSizingState = poly?.sizingState && typeof poly.sizingState === 'object' ? poly.sizingState : null;
+    if (!storedSizingState) {
+      return false;
+    }
+    const holdings = Array.isArray(storedSizingState.holdings) ? storedSizingState.holdings : [];
+    const makerCash = toNumber(storedSizingState.makerCash, null);
+    return holdings.length > 0 || Number.isFinite(makerCash);
+  })();
+
+  if (!pendingTrades.length && !shouldSeedFromPositionsSnapshot && !shouldRetryStoredLiveRebalance && !shouldApplyIdleSizeToBudget) {
     if (mode === 'backfill') {
       portfolio.polymarket = {
         ...snapshotPolymarket(portfolio.polymarket),
@@ -3196,6 +3244,22 @@ const syncPolymarketPortfolioInternal = async (portfolio, options = {}) => {
   let sizingMeta = null;
   let tradeScale = null;
   let seededFromPositionsSnapshot = false;
+  const selectMakerValueForSizing = ({ makerCashValue, makerHoldingsValue }) => {
+    const holdingsValue = Math.max(0, toNumber(makerHoldingsValue, 0));
+    const walletCashValue = Math.max(0, toNumber(makerCashValue, 0));
+    if (sizeToBudgetBasis === 'positions' && holdingsValue > 0) {
+      return {
+        scaleBasis: 'positions',
+        makerValue: holdingsValue,
+        copiedCashValue: 0,
+      };
+    }
+    return {
+      scaleBasis: 'wallet',
+      makerValue: holdingsValue + walletCashValue,
+      copiedCashValue: walletCashValue,
+    };
+  };
 
   const fetchMakerValueSnapshot = async () => {
     const positionsSnapshot = await fetchDataApiPositionsSnapshot({ userAddress: address });
@@ -3248,7 +3312,11 @@ const syncPolymarketPortfolioInternal = async (portfolio, options = {}) => {
 
     try {
       const snapshot = await fetchMakerValueSnapshot();
-      const makerValue = toNumber(snapshot?.makerValue, null);
+      const selectedSizingValue = selectMakerValueForSizing({
+        makerCashValue: snapshot?.makerCash,
+        makerHoldingsValue: snapshot?.makerHoldingsValue,
+      });
+      const makerValue = toNumber(selectedSizingValue?.makerValue, null);
       const scale = makerValue && makerValue > 0 ? sizingBudget / makerValue : 0;
 
       const positions = Array.isArray(snapshot?.positions) ? snapshot.positions : [];
@@ -3282,6 +3350,8 @@ const syncPolymarketPortfolioInternal = async (portfolio, options = {}) => {
         source: snapshot?.source || null,
         proxyWallet: snapshot?.proxyWallet || null,
         chainId: snapshot?.chainId ?? null,
+        sizeToBudgetBasis,
+        scaleBasis: selectedSizingValue?.scaleBasis || null,
         makerValue,
         makerCash: snapshot?.makerCash ?? null,
         makerHoldingsValue: snapshot?.makerHoldingsValue ?? null,
@@ -3970,7 +4040,13 @@ const syncPolymarketPortfolioInternal = async (portfolio, options = {}) => {
       }
       return acc + qty * price;
     }, 0);
-    const makerValue = makerCashValue + makerHoldingsValue;
+    const selectedSizingValue = selectMakerValueForSizing({
+      makerCashValue,
+      makerHoldingsValue,
+    });
+    const makerValue = selectedSizingValue.makerValue;
+    const copiedMakerCashValue = selectedSizingValue.copiedCashValue;
+    const scaleBasis = selectedSizingValue.scaleBasis;
     const sizingBudget = (() => {
       const cashLimit = pickNumber(portfolio.cashLimit);
       if (cashLimit !== null) {
@@ -3988,21 +4064,64 @@ const syncPolymarketPortfolioInternal = async (portfolio, options = {}) => {
     })();
     const storedScale = toNumber(existingSizingState?.scale, null);
     const storedScaleBudget = toNumber(existingSizingState?.scaleBudget, null);
+    const storedScaleBasis = normalizeSizeToBudgetBasis(existingSizingState?.scaleBasis, null);
     const shouldResetScale =
       !Number.isFinite(storedScale) ||
       storedScale <= 0 ||
       storedScaleBudget === null ||
-      Math.abs(storedScaleBudget - sizingBudget) > 1e-9;
+      Math.abs(storedScaleBudget - sizingBudget) > 1e-9 ||
+      storedScaleBasis !== scaleBasis;
     const computedScale = makerValue > 0 ? sizingBudget / makerValue : 0;
     const scale = shouldResetScale ? computedScale : storedScale;
 
     if (!Number.isFinite(scale) || scale <= 0) {
-      sizingMeta = { makerValue, sizingBudget, scale };
+      sizingMeta = {
+        makerValue,
+        makerCash: makerCashValue,
+        makerHoldingsValue,
+        sizingBudget,
+        scale,
+        sizeToBudgetBasis,
+        scaleBasis,
+      };
+      if (makerValue <= 0) {
+        updatedStocks = [];
+        cash = roundToDecimals(sizingBudget, 6) ?? 0;
+        portfolio.polymarket = {
+          ...snapshotPolymarket(portfolio.polymarket),
+          sizingState: {
+            makerCash: makerCashValue,
+            holdings: makerHoldings.map((pos) => ({
+              market: pos.market ? String(pos.market) : null,
+              asset_id: pos.asset_id ? String(pos.asset_id) : null,
+              outcome: pos.outcome ? String(pos.outcome) : null,
+              quantity: toNumber(pos.quantity, 0),
+              avgCost: toNumber(pos.avgCost, null),
+              currentPrice: toNumber(pos.currentPrice, null),
+            })),
+            scale: 0,
+            scaleBasis,
+            scaleBudget: sizingBudget,
+            scaleMakerValue: makerValue,
+            scaleSetAt: now.toISOString(),
+            lastUpdatedAt: now.toISOString(),
+          },
+        };
+        return true;
+      }
       return false;
     }
 
-	    sizingMeta = { makerValue, sizingBudget, scale };
-	    cash = roundToDecimals(makerCashValue * scale, 6) ?? 0;
+	    sizingMeta = {
+        makerValue,
+        makerCash: makerCashValue,
+        makerHoldingsValue,
+        sizingBudget,
+        scale,
+        sizeToBudgetBasis,
+        scaleBasis,
+      };
+	    cash = roundToDecimals(copiedMakerCashValue * scale, 6) ?? 0;
 
 	    const targetAssetIds = new Set();
 	    const nextStocks = [];
@@ -4191,6 +4310,7 @@ const syncPolymarketPortfolioInternal = async (portfolio, options = {}) => {
 	          currentPrice: toNumber(pos.currentPrice, null),
 	        })),
         scale,
+        scaleBasis,
         scaleBudget: shouldResetScale ? sizingBudget : storedScaleBudget,
         scaleMakerValue: shouldResetScale ? makerValue : toNumber(existingSizingState?.scaleMakerValue, null),
         scaleSetAt: shouldResetScale
@@ -5399,6 +5519,9 @@ const syncPolymarketPortfolioInternal = async (portfolio, options = {}) => {
         const label = formatUsd(sizingMeta.sizingBudget);
         if (label) segments.push(`budget ${label}`);
       }
+      if (sizingMeta?.scaleBasis) {
+        segments.push(`basis ${String(sizingMeta.scaleBasis)}`);
+      }
       if (sizingMeta?.scale !== undefined && sizingMeta?.scale !== null) {
         const label = formatNum(sizingMeta.scale, 8);
         if (label) segments.push(`scale ${label}`);
@@ -5524,31 +5647,32 @@ const syncPolymarketPortfolioInternal = async (portfolio, options = {}) => {
     }
   })();
 
-		  await recordStrategyLog({
-		    strategyId: portfolio.strategy_id,
-		    userId: portfolio.userId,
-		    strategyName: portfolio.name,
-		    level: liveExecutionAbort ? 'warn' : 'info',
-	    message: summaryMessage,
-		    details: {
-		      provider: 'polymarket',
+  await recordStrategyLog({
+    strategyId: portfolio.strategy_id,
+    userId: portfolio.userId,
+    strategyName: portfolio.name,
+    level: liveExecutionAbort ? 'warn' : 'info',
+    message: summaryMessage,
+    details: {
+      provider: 'polymarket',
           humanSummary,
-		      mode,
-		      tradeSource: tradeSourceUsed,
-		      tradesSourceSetting,
-	        envExecutionMode,
-	        portfolioExecutionMode,
-		      executionMode,
-		      executionEnabled,
-		      executionDisabledReason,
-			      executionAbort: liveExecutionAbort,
-	          portfolioUpdated: shouldApplyPortfolioUpdate,
-				  hasClobCredentials,
-				      clobAuthCooldown: getClobAuthCooldownStatus(),
-	            clobRateLimitCooldown: typeof getClobRateLimitCooldownStatus === 'function' ? getClobRateLimitCooldownStatus() : null,
-					      sizeToBudget: makerStateEnabled,
-				      sizedToBudget: didSize,
-	            seedFromPositions,
+      mode,
+      tradeSource: tradeSourceUsed,
+      tradesSourceSetting,
+      envExecutionMode,
+      portfolioExecutionMode,
+      executionMode,
+      executionEnabled,
+      executionDisabledReason,
+      executionAbort: liveExecutionAbort,
+      portfolioUpdated: shouldApplyPortfolioUpdate,
+      hasClobCredentials,
+      clobAuthCooldown: getClobAuthCooldownStatus(),
+      clobRateLimitCooldown: typeof getClobRateLimitCooldownStatus === 'function' ? getClobRateLimitCooldownStatus() : null,
+      sizeToBudget: makerStateEnabled,
+              sizeToBudgetBasis,
+      sizedToBudget: didSize,
+      seedFromPositions,
             seededFromPositionsSnapshot,
             ignoredTrades: ignoredTradesCount,
 			      sizing: sizingMeta,
