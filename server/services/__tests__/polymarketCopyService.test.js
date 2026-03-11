@@ -1580,16 +1580,21 @@ jest.mock('../strategyLogger', () => ({
     const result = await syncPolymarketPortfolio(portfolio, { mode: 'incremental' });
     expect(result.processed).toBe(1);
     expect(portfolio.save).not.toHaveBeenCalled();
-    expect(updateOne).toHaveBeenCalledTimes(1);
+    expect(updateOne).toHaveBeenCalledTimes(2);
 
-    const update = updateOne.mock.calls[0][1];
-    expect(update.$set['stocks.$[stocks0]']).toBeTruthy();
-    expect(update.$set['stocks.$[stocks0]']._id).toEqual(stockSubdocId);
-    expect(update.$set['stocks.$[stocks0]']._id).not.toEqual({});
-    expect(update.$set['stocks.$[stocks0]'].quantity).toBeLessThan(2);
-    expect(update.$set['polymarket.lastTradeId']).toContain('data-api:0x1111:');
-    expect(update.$set.polymarket).toBeUndefined();
-    expect(updateOne.mock.calls[0][2]?.arrayFilters).toEqual([{ 'stocks0.asset_id': 'asset-1' }]);
+    const stockUpdateCall = updateOne.mock.calls.find(([, update]) => Boolean(update?.$set?.['stocks.$[stocks0]']));
+    expect(stockUpdateCall).toBeTruthy();
+    const [, stockUpdate, stockOptions] = stockUpdateCall;
+    expect(stockUpdate.$set['stocks.$[stocks0]']._id).toEqual(stockSubdocId);
+    expect(stockUpdate.$set['stocks.$[stocks0]']._id).not.toEqual({});
+    expect(stockUpdate.$set['stocks.$[stocks0]'].quantity).toBeLessThan(2);
+    expect(stockOptions?.arrayFilters).toEqual([{ 'stocks0.asset_id': 'asset-1' }]);
+
+    const metaUpdateCall = updateOne.mock.calls.find(([, update]) => Boolean(update?.$set?.['polymarket.lastTradeId']));
+    expect(metaUpdateCall).toBeTruthy();
+    const [, metaUpdate] = metaUpdateCall;
+    expect(metaUpdate.$set['polymarket.lastTradeId']).toContain('data-api:0x1111:');
+    expect(metaUpdate.$set.polymarket).toBeUndefined();
   });
 
   it('uses unique array filter aliases for different in-place array paths', async () => {
@@ -1608,14 +1613,44 @@ jest.mock('../strategyLogger', () => ({
       keyField: 'asset_id',
     });
 
-    const stocksSetPath = Object.keys(stocksPlan.set)[0];
-    const sizingSetPath = Object.keys(sizingPlan.set)[0];
+    expect(stocksPlan.stats.mode).toBe('in_place');
+    expect(sizingPlan.stats.mode).toBe('in_place');
+    const stocksSetPath = Object.keys(stocksPlan.stages[0].set)[0];
+    const sizingSetPath = Object.keys(sizingPlan.stages[0].set)[0];
     expect(stocksSetPath).toBe('stocks.$[stocks0]');
-    expect(stocksPlan.arrayFilters).toEqual([{ 'stocks0.asset_id': 'asset-1' }]);
+    expect(stocksPlan.stages[0].arrayFilters).toEqual([{ 'stocks0.asset_id': 'asset-1' }]);
     expect(sizingSetPath).toMatch(/^polymarket\.sizingState\.holdings\.\$\[[a-zA-Z0-9_]+0\]$/);
     const sizingAlias = sizingSetPath.match(/\$\[([a-zA-Z0-9_]+)\]/)?.[1];
     expect(sizingAlias).toBeTruthy();
     expect(sizingAlias).not.toBe('stocks0');
-    expect(sizingPlan.arrayFilters).toEqual([{ [`${sizingAlias}.asset_id`]: 'asset-1' }]);
+    expect(sizingPlan.stages[0].arrayFilters).toEqual([{ [`${sizingAlias}.asset_id`]: 'asset-1' }]);
+  });
+
+  it('stages mixed keyed array changes instead of replacing the full array', async () => {
+    const { __testOnly } = require('../polymarketCopyService');
+
+    const plan = __testOnly.buildKeyedArrayUpdatePlan({
+      path: 'stocks',
+      previous: [
+        { asset_id: 'asset-1', quantity: 2 },
+        { asset_id: 'asset-2', quantity: 3 },
+      ],
+      next: [
+        { asset_id: 'asset-1', quantity: 1 },
+        { asset_id: 'asset-2', quantity: 3 },
+        { asset_id: 'asset-3', quantity: 4 },
+      ],
+      keyField: 'asset_id',
+    });
+
+    expect(plan.stats.mode).toBe('in_place_append');
+    expect(plan.stages).toHaveLength(2);
+    expect(plan.stages[0].set['stocks.$[stocks0]']).toBeTruthy();
+    expect(plan.stages[0].arrayFilters).toEqual([{ 'stocks0.asset_id': 'asset-1' }]);
+    expect(plan.stages[1].push).toEqual({
+      stocks: {
+        $each: [{ asset_id: 'asset-3', quantity: 4 }],
+      },
+    });
   });
 });

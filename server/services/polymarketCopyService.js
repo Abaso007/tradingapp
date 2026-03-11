@@ -609,41 +609,52 @@ const buildKeyedArrayUpdatePlan = ({
   if (!changedEntries.length && !addedEntries.length && !removedKeys.length) {
     return { stats };
   }
-  if (!addedEntries.length && !removedKeys.length && changedEntries.length <= MAX_TARGETED_ARRAY_ROW_UPDATES) {
-    const set = {};
-    const arrayFilters = [];
-    const aliasPrefix = buildArrayFilterAliasPrefix(path);
-    changedEntries.forEach((entry, index) => {
-      const alias = `${aliasPrefix}${index}`;
-      set[`${path}.$[${alias}]`] = entry;
-      arrayFilters.push({ [`${alias}.${keyField}`]: String(entry[keyField]) });
-    });
-    return {
-      set,
-      arrayFilters,
-      stats: {
-        ...stats,
-        mode: 'in_place',
-      },
-    };
-  }
-  if (!changedEntries.length && addedEntries.length && !removedKeys.length) {
-    return {
-      push: { [path]: { $each: addedEntries } },
-      stats: {
-        ...stats,
-        mode: 'append',
-      },
-    };
-  }
-  if (!changedEntries.length && !addedEntries.length && removedKeys.length) {
-    return {
-      pull: { [path]: { [keyField]: { $in: removedKeys } } },
-      stats: {
-        ...stats,
-        mode: 'remove',
-      },
-    };
+  const canTargetChangedRows = changedEntries.length <= MAX_TARGETED_ARRAY_ROW_UPDATES;
+  if (canTargetChangedRows) {
+    const stages = [];
+    if (changedEntries.length) {
+      const set = {};
+      const arrayFilters = [];
+      const aliasPrefix = buildArrayFilterAliasPrefix(path);
+      changedEntries.forEach((entry, index) => {
+        const alias = `${aliasPrefix}${index}`;
+        set[`${path}.$[${alias}]`] = entry;
+        arrayFilters.push({ [`${alias}.${keyField}`]: String(entry[keyField]) });
+      });
+      stages.push({
+        set,
+        arrayFilters,
+      });
+    }
+    if (removedKeys.length) {
+      stages.push({
+        pull: { [path]: { [keyField]: { $in: removedKeys } } },
+      });
+    }
+    if (addedEntries.length) {
+      stages.push({
+        push: { [path]: { $each: addedEntries } },
+      });
+    }
+    if (stages.length) {
+      const modeParts = [];
+      if (changedEntries.length) {
+        modeParts.push('in_place');
+      }
+      if (removedKeys.length) {
+        modeParts.push('remove');
+      }
+      if (addedEntries.length) {
+        modeParts.push('append');
+      }
+      return {
+        stages,
+        stats: {
+          ...stats,
+          mode: modeParts.join('_'),
+        },
+      };
+    }
   }
   return {
     set: { [path]: nextArray },
@@ -680,6 +691,14 @@ const applyUpdatePlan = (updateDoc, updateOptions, plan) => {
   if (Array.isArray(plan.arrayFilters) && plan.arrayFilters.length) {
     updateOptions.arrayFilters = [...(updateOptions.arrayFilters || []), ...plan.arrayFilters];
   }
+};
+const finalizeUpdateDoc = (updateDoc) => {
+  Object.keys(updateDoc).forEach((operator) => {
+    if (updateDoc[operator] && Object.keys(updateDoc[operator]).length === 0) {
+      delete updateDoc[operator];
+    }
+  });
+  return updateDoc;
 };
 const persistPolymarketPortfolioState = async (
   portfolio,
@@ -741,6 +760,24 @@ const persistPolymarketPortfolioState = async (
     sizingHoldingsAddedCount: 0,
     sizingHoldingsRemovedCount: 0,
   };
+  const stagedUpdates = [];
+
+  const pushStagePlan = (plan) => {
+    if (!plan) {
+      return;
+    }
+    const planStages = Array.isArray(plan.stages) && plan.stages.length ? plan.stages : [plan];
+    planStages.forEach((stagePlan) => {
+      const stageDoc = {};
+      const stageOptions = {};
+      applyUpdatePlan(stageDoc, stageOptions, stagePlan);
+      finalizeUpdateDoc(stageDoc);
+      if (Object.keys(stageDoc).length === 0) {
+        return;
+      }
+      stagedUpdates.push({ updateDoc: stageDoc, updateOptions: stageOptions });
+    });
+  };
 
   if (includeStocks) {
     const stocksPlan = buildKeyedArrayUpdatePlan({
@@ -751,7 +788,7 @@ const persistPolymarketPortfolioState = async (
       compareEntry: (left, right) =>
         areMongoValuesEqual(normalizeComparableStockEntry(left), normalizeComparableStockEntry(right)),
     });
-    applyUpdatePlan(updateDoc, updateOptions, stocksPlan);
+    pushStagePlan(stocksPlan);
     stats.stocksMode = stocksPlan?.stats?.mode || 'unchanged';
     stats.stocksChangedCount = stocksPlan?.stats?.changedCount || 0;
     stats.stocksAddedCount = stocksPlan?.stats?.addedCount || 0;
@@ -775,25 +812,30 @@ const persistPolymarketPortfolioState = async (
       compareEntry: (left, right) =>
         areMongoValuesEqual(normalizeComparableSizingHolding(left), normalizeComparableSizingHolding(right)),
     });
-    applyUpdatePlan(updateDoc, updateOptions, sizingHoldingsPlan);
+    pushStagePlan(sizingHoldingsPlan);
     stats.sizingHoldingsMode = sizingHoldingsPlan?.stats?.mode || 'unchanged';
     stats.sizingHoldingsChangedCount = sizingHoldingsPlan?.stats?.changedCount || 0;
     stats.sizingHoldingsAddedCount = sizingHoldingsPlan?.stats?.addedCount || 0;
     stats.sizingHoldingsRemovedCount = sizingHoldingsPlan?.stats?.removedCount || 0;
   }
 
-  Object.keys(updateDoc).forEach((operator) => {
-    if (updateDoc[operator] && Object.keys(updateDoc[operator]).length === 0) {
-      delete updateDoc[operator];
-    }
-  });
+  finalizeUpdateDoc(updateDoc);
+  if (Object.keys(updateDoc).length > 0) {
+    stagedUpdates.push({ updateDoc, updateOptions });
+  }
 
-  stats.setPathCount = Object.keys(updateDoc.$set || {}).length;
-  stats.unsetPathCount = Object.keys(updateDoc.$unset || {}).length;
-  stats.pushPathCount = Object.keys(updateDoc.$push || {}).length;
-  stats.pullPathCount = Object.keys(updateDoc.$pull || {}).length;
-  stats.arrayFilterCount = Array.isArray(updateOptions.arrayFilters) ? updateOptions.arrayFilters.length : 0;
-  stats.payloadBytes = estimateSerializedBytes({ update: updateDoc, options: updateOptions });
+  stats.setPathCount = stagedUpdates.reduce((acc, stage) => acc + Object.keys(stage.updateDoc.$set || {}).length, 0);
+  stats.unsetPathCount = stagedUpdates.reduce((acc, stage) => acc + Object.keys(stage.updateDoc.$unset || {}).length, 0);
+  stats.pushPathCount = stagedUpdates.reduce((acc, stage) => acc + Object.keys(stage.updateDoc.$push || {}).length, 0);
+  stats.pullPathCount = stagedUpdates.reduce((acc, stage) => acc + Object.keys(stage.updateDoc.$pull || {}).length, 0);
+  stats.arrayFilterCount = stagedUpdates.reduce(
+    (acc, stage) => acc + (Array.isArray(stage.updateOptions.arrayFilters) ? stage.updateOptions.arrayFilters.length : 0),
+    0
+  );
+  stats.payloadBytes = stagedUpdates.reduce((acc, stage) => {
+    const nextBytes = estimateSerializedBytes({ update: stage.updateDoc, options: stage.updateOptions });
+    return acc + (Number.isFinite(nextBytes) ? nextBytes : 0);
+  }, 0);
 
   if (shouldLog && process.env.NODE_ENV !== 'test') {
     console.log('[Polymarket Save Payload]', {
@@ -813,17 +855,20 @@ const persistPolymarketPortfolioState = async (
       sizingHoldingsChangedCount: stats.sizingHoldingsChangedCount,
       sizingHoldingsAddedCount: stats.sizingHoldingsAddedCount,
       sizingHoldingsRemovedCount: stats.sizingHoldingsRemovedCount,
+      operationCount: stagedUpdates.length,
     });
   }
 
-  if (Object.keys(updateDoc).length === 0) {
+  if (!stagedUpdates.length) {
     return stats;
   }
-  await Portfolio.updateOne(
-    { _id: portfolio._id },
-    updateDoc,
-    updateOptions
-  );
+  for (const stage of stagedUpdates) {
+    await Portfolio.updateOne(
+      { _id: portfolio._id },
+      stage.updateDoc,
+      stage.updateOptions
+    );
+  }
   return stats;
 };
 
