@@ -1627,6 +1627,29 @@ jest.mock('../strategyLogger', () => ({
     expect(sizingPlan.stages[0].arrayFilters).toEqual([{ [`${sizingAlias}.asset_id`]: 'asset-1' }]);
   });
 
+  it('reuses fresh stored maker prices and only refreshes incomplete holdings', async () => {
+    const { __testOnly } = require('../polymarketCopyService');
+    const nowMs = Date.parse('2026-03-11T14:00:00.000Z');
+
+    const refreshEntries = __testOnly.selectMarketRefreshEntries(
+      [
+        { market: 'cond-1', asset_id: 'asset-1', outcome: 'Yes', currentPrice: 0.6 },
+        { market: 'cond-2', asset_id: 'asset-2', outcome: null, currentPrice: 0.4 },
+        { market: 'cond-3', asset_id: 'asset-3', outcome: 'No', currentPrice: null },
+      ],
+      {
+        lastUpdatedAt: '2026-03-11T13:58:30.000Z',
+        nowMs,
+        maxAgeMs: 5 * 60_000,
+      }
+    );
+
+    expect(refreshEntries).toEqual([
+      { market: 'cond-2', asset_id: 'asset-2', outcome: null, currentPrice: 0.4 },
+      { market: 'cond-3', asset_id: 'asset-3', outcome: 'No', currentPrice: null },
+    ]);
+  });
+
   it('stages mixed keyed array changes instead of replacing the full array', async () => {
     const { __testOnly } = require('../polymarketCopyService');
 

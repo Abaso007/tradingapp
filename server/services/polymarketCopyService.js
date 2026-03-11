@@ -1423,6 +1423,13 @@ const POLYMARKET_MARKET_PREFETCH_CONCURRENCY = (() => {
   }
   return Math.max(1, Math.min(Math.floor(raw), 64));
 })();
+const POLYMARKET_SIZING_PRICE_REFRESH_MAX_AGE_MS = (() => {
+  const raw = Number(process.env.POLYMARKET_SIZING_PRICE_REFRESH_MAX_AGE_MS);
+  if (!Number.isFinite(raw)) {
+    return 5 * 60_000;
+  }
+  return Math.max(0, Math.min(Math.floor(raw), 60 * 60_000));
+})();
 
 const marketCacheByConditionId = new Map();
 const marketCacheInFlight = new Map();
@@ -1520,6 +1527,85 @@ const buildMarketTokenPriceIndex = (market) => {
     index.set(tokenId, { price, outcome });
   });
   return index;
+};
+const selectMarketRefreshEntries = (
+  entries,
+  {
+    lastUpdatedAt = null,
+    nowMs = Date.now(),
+    maxAgeMs = POLYMARKET_SIZING_PRICE_REFRESH_MAX_AGE_MS,
+  } = {}
+) => {
+  const normalizedEntries = Array.isArray(entries)
+    ? entries.filter((entry) => String(entry?.market || '').trim())
+    : [];
+  if (!normalizedEntries.length) {
+    return [];
+  }
+  const updatedAtMs = parseTimestampMs(lastUpdatedAt);
+  const isFresh =
+    maxAgeMs > 0 &&
+    Number.isFinite(updatedAtMs) &&
+    nowMs >= updatedAtMs &&
+    nowMs - updatedAtMs <= maxAgeMs;
+  return normalizedEntries.filter((entry) => {
+    const rawPrice = entry?.currentPrice;
+    const hasPrice =
+      rawPrice !== null &&
+      rawPrice !== undefined &&
+      rawPrice !== '' &&
+      Number.isFinite(Number(rawPrice));
+    const hasOutcome = Boolean(String(entry?.outcome || '').trim());
+    if (!hasPrice || !hasOutcome) {
+      return true;
+    }
+    return !isFresh;
+  });
+};
+const createMarketResolver = () => {
+  const marketCache = new Map();
+  const tokenIndexCache = new Map();
+  const ensureMarket = async (conditionId) => {
+    const key = String(conditionId || '').trim();
+    if (!key) {
+      return null;
+    }
+    if (marketCache.has(key)) {
+      return marketCache.get(key);
+    }
+    try {
+      const market = await fetchMarketCached(key);
+      marketCache.set(key, market);
+      return market;
+    } catch (error) {
+      marketCache.set(key, null);
+      return null;
+    }
+  };
+  const getTokenInfo = async (conditionId, assetId) => {
+    const marketKey = String(conditionId || '').trim();
+    const tokenKey = String(assetId || '').trim();
+    if (!marketKey || !tokenKey) {
+      return { market: null, tokenInfo: null };
+    }
+    const market = await ensureMarket(marketKey);
+    if (!market) {
+      return { market: null, tokenInfo: null };
+    }
+    let tokenIndex = tokenIndexCache.get(marketKey);
+    if (!tokenIndex) {
+      tokenIndex = buildMarketTokenPriceIndex(market);
+      tokenIndexCache.set(marketKey, tokenIndex);
+    }
+    return {
+      market,
+      tokenInfo: tokenIndex.get(tokenKey) || null,
+    };
+  };
+  return {
+    ensureMarket,
+    getTokenInfo,
+  };
 };
 
 const isValidHexAddress = (value) => {
@@ -2278,24 +2364,7 @@ const syncPolymarketPortfolioInternal = async (portfolio, options = {}) => {
       return [];
     }
 
-    const marketCache = new Map();
-    const ensureMarket = async (conditionId) => {
-      const key = String(conditionId || '').trim();
-      if (!key) {
-        return null;
-      }
-      if (marketCache.has(key)) {
-        return marketCache.get(key);
-      }
-      try {
-        const market = await fetchMarketCached(key);
-        marketCache.set(key, market);
-        return market;
-      } catch (error) {
-        marketCache.set(key, null);
-        return null;
-      }
-    };
+    const { ensureMarket, getTokenInfo } = createMarketResolver();
     await prefetchMarkets(
       stocks.map((entry) => (entry?.market ? String(entry.market) : null)),
       ensureMarket
@@ -2307,12 +2376,10 @@ const syncPolymarketPortfolioInternal = async (portfolio, options = {}) => {
       if (!conditionId || !assetId) {
         continue;
       }
-      const market = await ensureMarket(conditionId);
+      const { market, tokenInfo } = await getTokenInfo(conditionId, assetId);
       if (!market) {
         continue;
       }
-      const index = buildMarketTokenPriceIndex(market);
-      const tokenInfo = index.get(assetId);
       if (tokenInfo && tokenInfo.price !== null) {
         entry.currentPrice = tokenInfo.price;
       }
@@ -3201,24 +3268,7 @@ const syncPolymarketPortfolioInternal = async (portfolio, options = {}) => {
       });
     }
   }
-  const marketCache = new Map();
-  const ensureMarket = async (conditionId) => {
-    const key = String(conditionId || '').trim();
-    if (!key) {
-      return null;
-    }
-    if (marketCache.has(key)) {
-      return marketCache.get(key);
-    }
-    try {
-      const market = await fetchMarketCached(key);
-      marketCache.set(key, market);
-      return market;
-    } catch (error) {
-      marketCache.set(key, null);
-      return null;
-    }
-  };
+  const { ensureMarket, getTokenInfo } = createMarketResolver();
 
   const tradeSummary = {
     buys: [],
@@ -3834,38 +3884,44 @@ const syncPolymarketPortfolioInternal = async (portfolio, options = {}) => {
   let updatedStocks = [];
   let rebalancePlan = null;
   let executionPreflight = null;
+  let applySizingRefreshedHoldingsCount = 0;
 
   const applySizing = async () => {
     if (!makerStateEnabled || !makerStateAvailable) {
       return false;
     }
 
-    await prefetchMarkets(
-      Array.from(makerHoldingsByAssetId.values()).map((entry) => (entry?.market ? String(entry.market) : null)),
-      ensureMarket
-    );
+    const existingSizingState =
+      poly?.sizingState && typeof poly.sizingState === 'object' ? poly.sizingState : {};
+    const makerHoldings = Array.from(makerHoldingsByAssetId.values());
+    const refreshEntries = selectMarketRefreshEntries(makerHoldings, {
+      lastUpdatedAt: existingSizingState?.lastUpdatedAt,
+      nowMs,
+    });
+    applySizingRefreshedHoldingsCount = refreshEntries.length;
+    if (refreshEntries.length) {
+      await prefetchMarkets(
+        refreshEntries.map((entry) => (entry?.market ? String(entry.market) : null)),
+        ensureMarket
+      );
 
-    // Refresh current prices for maker holdings.
-    for (const [assetId, entry] of makerHoldingsByAssetId.entries()) {
-      const conditionId = entry?.market ? String(entry.market) : null;
-      if (!conditionId) {
-        continue;
-      }
-      const market = await ensureMarket(conditionId);
-      if (!market) {
-        continue;
-      }
-      const index = buildMarketTokenPriceIndex(market);
-      const tokenInfo = index.get(String(assetId));
-      if (tokenInfo && tokenInfo.price !== null) {
-        entry.currentPrice = tokenInfo.price;
-        if (!entry.outcome && tokenInfo.outcome) {
+      // Refresh current prices for maker holdings only when stored values are missing or stale.
+      for (const entry of refreshEntries) {
+        const conditionId = entry?.market ? String(entry.market) : null;
+        const assetId = entry?.asset_id ? String(entry.asset_id) : null;
+        if (!conditionId || !assetId) {
+          continue;
+        }
+        const { tokenInfo } = await getTokenInfo(conditionId, assetId);
+        if (tokenInfo && tokenInfo.price !== null) {
+          entry.currentPrice = tokenInfo.price;
+        }
+        if (tokenInfo && tokenInfo.outcome && !entry.outcome) {
           entry.outcome = tokenInfo.outcome;
         }
       }
     }
 
-    const makerHoldings = Array.from(makerHoldingsByAssetId.values());
     const makerCashValue = Math.max(0, toNumber(makerCash, 0));
     const makerHoldingsValue = makerHoldings.reduce((acc, pos) => {
       const qty = Math.max(0, toNumber(pos.quantity, 0));
@@ -3891,8 +3947,6 @@ const syncPolymarketPortfolioInternal = async (portfolio, options = {}) => {
       }
       return Math.max(0, toNumber(startingCash, 0));
     })();
-    const existingSizingState =
-      poly?.sizingState && typeof poly.sizingState === 'object' ? poly.sizingState : {};
     const storedScale = toNumber(existingSizingState?.scale, null);
     const storedScaleBudget = toNumber(existingSizingState?.scaleBudget, null);
     const shouldResetScale =
@@ -4118,6 +4172,7 @@ const syncPolymarketPortfolioInternal = async (portfolio, options = {}) => {
     didSize,
     makerStateEnabled,
     makerStateAvailable,
+    refreshedHoldingsCount: applySizingRefreshedHoldingsCount,
   });
 
   if (!didSize) {
@@ -4132,12 +4187,10 @@ const syncPolymarketPortfolioInternal = async (portfolio, options = {}) => {
       if (!conditionId) {
         continue;
       }
-      const market = await ensureMarket(conditionId);
+      const { market, tokenInfo } = await getTokenInfo(conditionId, assetId);
       if (!market) {
         continue;
       }
-      const index = buildMarketTokenPriceIndex(market);
-      const tokenInfo = index.get(String(assetId));
       if (tokenInfo && tokenInfo.price !== null) {
         entry.currentPrice = tokenInfo.price;
         if (!entry.outcome && tokenInfo.outcome) {
@@ -5557,5 +5610,6 @@ module.exports = {
   __testOnly: {
     buildKeyedArrayUpdatePlan,
     persistPolymarketPortfolioState,
+    selectMarketRefreshEntries,
   },
 };
