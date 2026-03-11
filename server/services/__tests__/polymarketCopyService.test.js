@@ -15,6 +15,7 @@ jest.mock('../strategyLogger', () => ({
       'POLYMARKET_AUTH_ADDRESS',
       'POLYMARKET_BACKFILL_LIVE_REBALANCE',
       'POLYMARKET_SIZE_TO_BUDGET',
+      'POLYMARKET_HOLDINGS_PRICE_REFRESH_MAX_AGE_MS',
       'POLYMARKET_LIVE_REBALANCE_MIN_NOTIONAL',
       'POLYMARKET_LIVE_REBALANCE_MAX_ORDERS',
       'POLYMARKET_ILLIQUID_TOKEN_COOLDOWN_MS',
@@ -1648,6 +1649,59 @@ jest.mock('../strategyLogger', () => ({
       { market: 'cond-2', asset_id: 'asset-2', outcome: null, currentPrice: 0.4 },
       { market: 'cond-3', asset_id: 'asset-3', outcome: 'No', currentPrice: null },
     ]);
+  });
+
+  it('skips holdings market refresh on idle sync when holdings prices are still fresh', async () => {
+    process.env.POLYMARKET_TRADES_SOURCE = 'data-api';
+    process.env.POLYMARKET_HOLDINGS_PRICE_REFRESH_MAX_AGE_MS = String(24 * 60 * 60 * 1000);
+
+    const dataApi = nock('https://data-api.polymarket.com');
+    dataApi.get('/trades').query(true).reply(200, []);
+
+    const clob = nock('https://clob.polymarket.com');
+    clob.get('/markets/cond-1').query(true).reply(200, {
+      tokens: [{ token_id: 'asset-1', price: 0.6, outcome: 'Yes' }],
+    });
+
+    const { syncPolymarketPortfolio } = require('../polymarketCopyService');
+
+    const portfolio = {
+      provider: 'polymarket',
+      userId: 'user-1',
+      strategy_id: 'strategy-1',
+      name: 'Polymarket Fresh Holdings',
+      recurrence: 'every_minute',
+      stocks: [
+        {
+          symbol: 'PM:cond-1:Yes',
+          orderID: 'poly-asset-1',
+          market: 'cond-1',
+          asset_id: 'asset-1',
+          outcome: 'Yes',
+          avgCost: 0.5,
+          quantity: 2,
+          currentPrice: 0.6,
+        },
+      ],
+      retainedCash: 100,
+      cashBuffer: 100,
+      budget: 100,
+      cashLimit: 100,
+      initialInvestment: 100,
+      rebalanceCount: 0,
+      lastPerformanceComputedAt: new Date().toISOString(),
+      save: jest.fn(async () => {}),
+      polymarket: {
+        address: '0x3333333333333333333333333333333333333333',
+        backfillPending: false,
+        lastTradeMatchTime: '1970-01-01T00:00:00.000Z',
+        lastTradeId: null,
+      },
+    };
+
+    const result = await syncPolymarketPortfolio(portfolio, { mode: 'incremental' });
+    expect(result.processed).toBe(0);
+    expect(clob.isDone()).toBe(false);
   });
 
   it('stages mixed keyed array changes instead of replacing the full array', async () => {

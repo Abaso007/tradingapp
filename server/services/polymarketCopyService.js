@@ -1423,6 +1423,13 @@ const POLYMARKET_MARKET_PREFETCH_CONCURRENCY = (() => {
   }
   return Math.max(1, Math.min(Math.floor(raw), 64));
 })();
+const POLYMARKET_HOLDINGS_PRICE_REFRESH_MAX_AGE_MS = (() => {
+  const raw = Number(process.env.POLYMARKET_HOLDINGS_PRICE_REFRESH_MAX_AGE_MS);
+  if (!Number.isFinite(raw)) {
+    return 5 * 60_000;
+  }
+  return Math.max(0, Math.min(Math.floor(raw), 60 * 60_000));
+})();
 const POLYMARKET_SIZING_PRICE_REFRESH_MAX_AGE_MS = (() => {
   const raw = Number(process.env.POLYMARKET_SIZING_PRICE_REFRESH_MAX_AGE_MS);
   if (!Number.isFinite(raw)) {
@@ -2359,18 +2366,41 @@ const syncPolymarketPortfolioInternal = async (portfolio, options = {}) => {
     }
   };
 
-  const refreshHoldingsPrices = async (stocks = []) => {
+  const refreshHoldingsPrices = async (
+    stocks = [],
+    {
+      lastUpdatedAt = null,
+      nowMs: refreshNowMs = Date.now(),
+    } = {}
+  ) => {
     if (!Array.isArray(stocks) || !stocks.length) {
-      return [];
+      return {
+        positionsCount: 0,
+        refreshedCount: 0,
+        skippedFresh: false,
+      };
+    }
+
+    const refreshEntries = selectMarketRefreshEntries(stocks, {
+      lastUpdatedAt,
+      nowMs: refreshNowMs,
+      maxAgeMs: POLYMARKET_HOLDINGS_PRICE_REFRESH_MAX_AGE_MS,
+    });
+    if (!refreshEntries.length) {
+      return {
+        positionsCount: stocks.length,
+        refreshedCount: 0,
+        skippedFresh: true,
+      };
     }
 
     const { ensureMarket, getTokenInfo } = createMarketResolver();
     await prefetchMarkets(
-      stocks.map((entry) => (entry?.market ? String(entry.market) : null)),
+      refreshEntries.map((entry) => (entry?.market ? String(entry.market) : null)),
       ensureMarket
     );
 
-    for (const entry of stocks) {
+    for (const entry of refreshEntries) {
       const conditionId = entry?.market ? String(entry.market) : null;
       const assetId = entry?.asset_id ? String(entry.asset_id) : null;
       if (!conditionId || !assetId) {
@@ -2394,7 +2424,11 @@ const syncPolymarketPortfolioInternal = async (portfolio, options = {}) => {
       }
     }
 
-    return stocks;
+    return {
+      positionsCount: stocks.length,
+      refreshedCount: refreshEntries.length,
+      skippedFresh: false,
+    };
   };
 
   const maxTradesBackfill = bootstrapBackfill
@@ -2893,9 +2927,14 @@ const syncPolymarketPortfolioInternal = async (portfolio, options = {}) => {
     }
     const currentHoldings = Array.isArray(portfolio.stocks) ? portfolio.stocks : [];
     const refreshHoldingsStartedAtMs = Date.now();
-    await refreshHoldingsPrices(currentHoldings);
+    const refreshHoldingsResult = await refreshHoldingsPrices(currentHoldings, {
+      lastUpdatedAt: portfolio.lastPerformanceComputedAt || portfolio.lastRebalancedAt || null,
+      nowMs,
+    });
     notePhaseTiming('refreshHoldingsPrices', refreshHoldingsStartedAtMs, {
       positionsCount: currentHoldings.length,
+      refreshedCount: refreshHoldingsResult.refreshedCount,
+      skippedFresh: refreshHoldingsResult.skippedFresh,
     });
     portfolio.lastRebalancedAt = now;
     portfolio.nextRebalanceAt = computeNextRebalanceAt(normalizeRecurrence(portfolio.recurrence), now);
