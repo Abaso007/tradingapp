@@ -32,7 +32,7 @@ const StrategyLogs = ({ strategyId, strategyName, onClose = () => {} }) => {
           "x-auth-token": token,
         };
 
-        const response = await Axios.get(url, { headers, timeout: 15000 });
+        const response = await Axios.get(url, { headers });
 
         if (!isMounted) {
           return;

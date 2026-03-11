@@ -2563,13 +2563,100 @@ exports.getStrategyLogs = async (req, res) => {
       : 100;
     const compact = String(req.query?.compact ?? '1') !== '0';
 
-    const logs = await StrategyLog.find({
-      strategy_id: strategyId,
-      userId: String(userId),
-    })
-      .sort({ createdAt: -1 })
-      .limit(limit)
-      .lean();
+    const logs = await StrategyLog.aggregate([
+      {
+        $match: {
+          strategy_id: strategyId,
+          userId: String(userId),
+        },
+      },
+      {
+        $sort: {
+          createdAt: -1,
+          _id: -1,
+        },
+      },
+      {
+        $limit: limit,
+      },
+      {
+        $project: {
+          _id: 1,
+          strategy_id: 1,
+          strategyName: 1,
+          level: 1,
+          message: 1,
+          createdAt: 1,
+          details: {
+            provider: '$details.provider',
+            humanSummary: '$details.humanSummary',
+            mode: '$details.mode',
+            executionMode: '$details.executionMode',
+            portfolioUpdated: '$details.portfolioUpdated',
+            sizeToBudget: '$details.sizeToBudget',
+            buyCount: '$details.buyCount',
+            sellCount: '$details.sellCount',
+            rebalanceCount: '$details.rebalanceCount',
+            skippedCount: '$details.skippedCount',
+            error: '$details.error',
+            sizing: {
+              sizingBudget: '$details.sizing.sizingBudget',
+              scale: '$details.sizing.scale',
+              makerValue: '$details.sizing.makerValue',
+              scaleBudget: '$details.sizing.scaleBudget',
+              scaleMakerValue: '$details.sizing.scaleMakerValue',
+              scaleSetAt: '$details.sizing.scaleSetAt',
+              lastUpdatedAt: '$details.sizing.lastUpdatedAt',
+            },
+            thoughtProcess: {
+              summary: '$details.thoughtProcess.summary',
+              reasoning: {
+                $slice: [{ $ifNull: ['$details.thoughtProcess.reasoning', []] }, 20],
+              },
+              adjustments: {
+                $slice: [{ $ifNull: ['$details.thoughtProcess.adjustments', []] }, 20],
+              },
+              cashSummary: {
+                startingCash: '$details.thoughtProcess.cashSummary.startingCash',
+                sellProceeds: '$details.thoughtProcess.cashSummary.sellProceeds',
+                spentOnBuys: '$details.thoughtProcess.cashSummary.spentOnBuys',
+                endingCash: '$details.thoughtProcess.cashSummary.endingCash',
+                cashBefore: '$details.thoughtProcess.cashSummary.cashBefore',
+                cashAfterSells: '$details.thoughtProcess.cashSummary.cashAfterSells',
+                cashAfterBuys: '$details.thoughtProcess.cashSummary.cashAfterBuys',
+                cashBuffer: '$details.thoughtProcess.cashSummary.cashBuffer',
+                buyBudget: '$details.thoughtProcess.cashSummary.buyBudget',
+              },
+              composerPositions: {
+                $slice: [{ $ifNull: ['$details.thoughtProcess.composerPositions', []] }, 25],
+              },
+              tooling: {
+                localEvaluator: {
+                  used: '$details.thoughtProcess.tooling.localEvaluator.used',
+                  lookbackDays: '$details.thoughtProcess.tooling.localEvaluator.lookbackDays',
+                  fallbackReason: '$details.thoughtProcess.tooling.localEvaluator.fallbackReason',
+                  tickers: '$details.thoughtProcess.tooling.localEvaluator.tickers',
+                  blueprint: '$details.thoughtProcess.tooling.localEvaluator.blueprint',
+                },
+              },
+            },
+            liveRebalancePlan: '$details.liveRebalancePlan',
+            buys: {
+              $slice: [{ $ifNull: ['$details.buys', []] }, 100],
+            },
+            sells: {
+              $slice: [{ $ifNull: ['$details.sells', []] }, 100],
+            },
+            rebalance: {
+              $slice: [{ $ifNull: ['$details.rebalance', []] }, 100],
+            },
+            holds: {
+              $slice: [{ $ifNull: ['$details.holds', []] }, 100],
+            },
+          },
+        },
+      },
+    ]);
 
     const responseLogs = compact
       ? logs.map((log) => ({
