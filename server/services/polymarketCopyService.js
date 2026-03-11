@@ -524,6 +524,11 @@ const collectMongoFieldDiff = (path, before, after, updateDoc) => {
   addUpdateSet(updateDoc, path, after);
 };
 const MAX_TARGETED_ARRAY_ROW_UPDATES = 50;
+const buildArrayFilterAliasPrefix = (path) =>
+  String(path || 'row')
+    .replace(/[^a-zA-Z0-9]+/g, '_')
+    .replace(/^_+|_+$/g, '')
+    .slice(0, 24) || 'row';
 const buildKeyedArrayUpdatePlan = ({
   path,
   previous,
@@ -607,8 +612,9 @@ const buildKeyedArrayUpdatePlan = ({
   if (!addedEntries.length && !removedKeys.length && changedEntries.length <= MAX_TARGETED_ARRAY_ROW_UPDATES) {
     const set = {};
     const arrayFilters = [];
+    const aliasPrefix = buildArrayFilterAliasPrefix(path);
     changedEntries.forEach((entry, index) => {
-      const alias = `row${index}`;
+      const alias = `${aliasPrefix}${index}`;
       set[`${path}.$[${alias}]`] = entry;
       arrayFilters.push({ [`${alias}.${keyField}`]: String(entry[keyField]) });
     });
@@ -5487,4 +5493,8 @@ module.exports = {
   getClobAuthCooldownStatus,
   resetClobAuthCooldown,
   normalizeTradesSourceSetting,
+  __testOnly: {
+    buildKeyedArrayUpdatePlan,
+    persistPolymarketPortfolioState,
+  },
 };

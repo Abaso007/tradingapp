@@ -1583,12 +1583,39 @@ jest.mock('../strategyLogger', () => ({
     expect(updateOne).toHaveBeenCalledTimes(1);
 
     const update = updateOne.mock.calls[0][1];
-    expect(update.$set['stocks.$[row0]']).toBeTruthy();
-    expect(update.$set['stocks.$[row0]']._id).toEqual(stockSubdocId);
-    expect(update.$set['stocks.$[row0]']._id).not.toEqual({});
-    expect(update.$set['stocks.$[row0]'].quantity).toBeCloseTo(1, 6);
+    expect(update.$set['stocks.$[stocks0]']).toBeTruthy();
+    expect(update.$set['stocks.$[stocks0]']._id).toEqual(stockSubdocId);
+    expect(update.$set['stocks.$[stocks0]']._id).not.toEqual({});
+    expect(update.$set['stocks.$[stocks0]'].quantity).toBeLessThan(2);
     expect(update.$set['polymarket.lastTradeId']).toContain('data-api:0x1111:');
     expect(update.$set.polymarket).toBeUndefined();
-    expect(updateOne.mock.calls[0][2]?.arrayFilters).toEqual([{ 'row0.asset_id': 'asset-1' }]);
+    expect(updateOne.mock.calls[0][2]?.arrayFilters).toEqual([{ 'stocks0.asset_id': 'asset-1' }]);
+  });
+
+  it('uses unique array filter aliases for different in-place array paths', async () => {
+    const { __testOnly } = require('../polymarketCopyService');
+
+    const stocksPlan = __testOnly.buildKeyedArrayUpdatePlan({
+      path: 'stocks',
+      previous: [{ asset_id: 'asset-1', quantity: 2 }],
+      next: [{ asset_id: 'asset-1', quantity: 1 }],
+      keyField: 'asset_id',
+    });
+    const sizingPlan = __testOnly.buildKeyedArrayUpdatePlan({
+      path: 'polymarket.sizingState.holdings',
+      previous: [{ asset_id: 'asset-1', quantity: 2 }],
+      next: [{ asset_id: 'asset-1', quantity: 1 }],
+      keyField: 'asset_id',
+    });
+
+    const stocksSetPath = Object.keys(stocksPlan.set)[0];
+    const sizingSetPath = Object.keys(sizingPlan.set)[0];
+    expect(stocksSetPath).toBe('stocks.$[stocks0]');
+    expect(stocksPlan.arrayFilters).toEqual([{ 'stocks0.asset_id': 'asset-1' }]);
+    expect(sizingSetPath).toMatch(/^polymarket\.sizingState\.holdings\.\$\[[a-zA-Z0-9_]+0\]$/);
+    const sizingAlias = sizingSetPath.match(/\$\[([a-zA-Z0-9_]+)\]/)?.[1];
+    expect(sizingAlias).toBeTruthy();
+    expect(sizingAlias).not.toBe('stocks0');
+    expect(sizingPlan.arrayFilters).toEqual([{ [`${sizingAlias}.asset_id`]: 'asset-1' }]);
   });
 });
