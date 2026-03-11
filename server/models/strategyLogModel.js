@@ -16,6 +16,7 @@ const parseTtlDays = (value, defaultDays) => {
 };
 
 // Keep strategy logs bounded to avoid filling up small MongoDB tiers (ex: Atlas M0 512MB).
+// Age-based retention is controlled here; count-based retention is enforced in strategyLogger.js.
 // Set STRATEGY_LOG_TTL_DAYS<=0 to disable TTL (not recommended).
 const STRATEGY_LOG_TTL_DAYS = parseTtlDays(process.env.STRATEGY_LOG_TTL_DAYS, 14);
 
