@@ -95,6 +95,14 @@ const POLYMARKET_CLOB_MIN_REQUEST_INTERVAL_MS = (() => {
   return Math.max(0, Math.min(Math.floor(raw), 10_000));
 })();
 
+const POLYMARKET_CLOB_MAX_CONCURRENT_REQUESTS = (() => {
+  const raw = Number(process.env.POLYMARKET_CLOB_MAX_CONCURRENT_REQUESTS);
+  if (!Number.isFinite(raw)) {
+    return 1;
+  }
+  return Math.max(1, Math.min(Math.floor(raw), 8));
+})();
+
 const POLYMARKET_CLOB_SERVER_TIME_CACHE_MS = (() => {
   const raw = Number(process.env.POLYMARKET_CLOB_SERVER_TIME_CACHE_MS);
   if (!Number.isFinite(raw)) {
@@ -126,6 +134,56 @@ const getClobThrottleState = (host) => {
   };
   clobThrottleStateByHost.set(key, created);
   return created;
+};
+
+const clobRequestConcurrencyStateByHost = new Map();
+const getClobRequestConcurrencyState = (host) => {
+  const key = normalizeEnvValue(host);
+  if (!key) {
+    return null;
+  }
+  const existing = clobRequestConcurrencyStateByHost.get(key);
+  if (existing) {
+    return existing;
+  }
+  const created = {
+    activeCount: 0,
+    waitQueue: [],
+  };
+  clobRequestConcurrencyStateByHost.set(key, created);
+  return created;
+};
+
+const acquireClobRequestSlot = async (host) => {
+  const state = getClobRequestConcurrencyState(host);
+  if (!state || POLYMARKET_CLOB_MAX_CONCURRENT_REQUESTS <= 0) {
+    return () => {};
+  }
+
+  return await new Promise((resolve) => {
+    const grant = () => {
+      state.activeCount += 1;
+      let released = false;
+      resolve(() => {
+        if (released) {
+          return;
+        }
+        released = true;
+        state.activeCount = Math.max(0, state.activeCount - 1);
+        const next = state.waitQueue.shift();
+        if (typeof next === 'function') {
+          next();
+        }
+      });
+    };
+
+    if (state.activeCount < POLYMARKET_CLOB_MAX_CONCURRENT_REQUESTS) {
+      grant();
+      return;
+    }
+
+    state.waitQueue.push(grant);
+  });
 };
 
 const clobServerTimeCacheByHost = new Map();
@@ -182,6 +240,15 @@ const resetClobRateLimitCooldown = () => {
   clobRateLimitState.lastStatus = null;
   clobRateLimitState.lastTriggeredAtMs = 0;
   clobRateLimitState.lastRetryAfterMs = 0;
+};
+
+const resetClobExecutionRuntimeState = () => {
+  resetClobRateLimitCooldown();
+  clobThrottleStateByHost.clear();
+  clobRequestConcurrencyStateByHost.clear();
+  clobServerTimeCacheByHost.clear();
+  cachedClient = null;
+  cachedClientKey = null;
 };
 
 let clobUserAgentInterceptorKeyCjs = null;
@@ -414,6 +481,7 @@ const noteClobRateLimit = ({ status, headers, payload } = {}) => {
   const now = Date.now();
   const retryAfterMs = parseRetryAfterMs(headers) || 0;
   const cooldownMs = Math.max(POLYMARKET_CLOB_RATE_LIMIT_COOLDOWN_MS, retryAfterMs);
+  const previousDisabledUntilMs = Number(clobRateLimitState.disabledUntilMs) || 0;
   const disabledUntilMs = now + cooldownMs;
   clobRateLimitState.disabledUntilMs = Math.max(clobRateLimitState.disabledUntilMs || 0, disabledUntilMs);
   clobRateLimitState.lastStatus = Number.isFinite(Number(status)) ? Number(status) : null;
@@ -421,7 +489,7 @@ const noteClobRateLimit = ({ status, headers, payload } = {}) => {
   clobRateLimitState.lastRetryAfterMs = retryAfterMs;
 
   const isCloudflare = looksLikeCloudflareBlockPage(payload) || looksLikeCloudflareRateLimitPage(payload);
-  if (isCloudflare) {
+  if (isCloudflare && clobRateLimitState.disabledUntilMs > previousDisabledUntilMs) {
     try {
       console.warn(
         `[CLOB Client] Rate limited by Cloudflare; pausing requests for ${Math.round(cooldownMs / 1000)}s.`
@@ -432,6 +500,29 @@ const noteClobRateLimit = ({ status, headers, payload } = {}) => {
   }
 
   return new Date(clobRateLimitState.disabledUntilMs).toISOString();
+};
+
+const releaseClobRequestSlotFromConfig = (config) => {
+  const release = config?.__polymarketClobRelease;
+  if (typeof release !== 'function') {
+    return;
+  }
+  try {
+    release();
+  } catch {
+    // ignore
+  }
+  attachHiddenConfigValue(config, '__polymarketClobRelease', null);
+};
+
+const buildClobRateLimitError = () => {
+  const remainingMs = Math.max(0, clobRateLimitState.disabledUntilMs - Date.now());
+  const err = new Error(
+    `Polymarket CLOB temporarily rate limited (cooldown ${Math.ceil(remainingMs / 1000)}s remaining).`
+  );
+  err.status = 429;
+  err.code = 'POLYMARKET_RATE_LIMIT';
+  return err;
 };
 
 const ensureAxiosRequestGuardInterceptor = (axiosInstance, host, currentKey) => {
@@ -451,38 +542,52 @@ const ensureAxiosRequestGuardInterceptor = (axiosInstance, host, currentKey) => 
       return config;
     }
 
-    if (!config.timeout || Number(config.timeout) <= 0) {
-      config.timeout = POLYMARKET_CLOB_TIMEOUT_MS;
-    }
+    let releaseSlot = null;
+    try {
+      releaseSlot = await acquireClobRequestSlot(host);
+      attachHiddenConfigValue(config, '__polymarketClobRelease', releaseSlot);
 
-    if (isClobRateLimitActive()) {
-      const remainingMs = Math.max(0, clobRateLimitState.disabledUntilMs - Date.now());
-      const err = new Error(
-        `Polymarket CLOB temporarily rate limited (cooldown ${Math.ceil(remainingMs / 1000)}s remaining).`
-      );
-      err.status = 429;
-      err.code = 'POLYMARKET_RATE_LIMIT';
-      throw err;
-    }
+      if (!config.timeout || Number(config.timeout) <= 0) {
+        config.timeout = POLYMARKET_CLOB_TIMEOUT_MS;
+      }
 
-    if (POLYMARKET_CLOB_MIN_REQUEST_INTERVAL_MS > 0) {
-      const state = getClobThrottleState(host);
-      if (state) {
-        const now = Date.now();
-        const scheduledAt = Math.max(now, Number(state.nextAllowedAtMs) || 0);
-        state.nextAllowedAtMs = scheduledAt + POLYMARKET_CLOB_MIN_REQUEST_INTERVAL_MS;
-        const waitMs = scheduledAt - now;
-        if (waitMs > 0) {
-          await sleep(waitMs);
+      if (isClobRateLimitActive()) {
+        releaseClobRequestSlotFromConfig(config);
+        throw buildClobRateLimitError();
+      }
+
+      if (POLYMARKET_CLOB_MIN_REQUEST_INTERVAL_MS > 0) {
+        const state = getClobThrottleState(host);
+        if (state) {
+          const now = Date.now();
+          const scheduledAt = Math.max(now, Number(state.nextAllowedAtMs) || 0);
+          state.nextAllowedAtMs = scheduledAt + POLYMARKET_CLOB_MIN_REQUEST_INTERVAL_MS;
+          const waitMs = scheduledAt - now;
+          if (waitMs > 0) {
+            await sleep(waitMs);
+          }
         }
       }
-    }
 
-    return config;
+      if (isClobRateLimitActive()) {
+        releaseClobRequestSlotFromConfig(config);
+        throw buildClobRateLimitError();
+      }
+
+      return config;
+    } catch (error) {
+      if (releaseSlot) {
+        releaseClobRequestSlotFromConfig(config);
+      }
+      throw error;
+    }
   });
 
   axiosInstance.interceptors.response.use(
-    (response) => response,
+    (response) => {
+      releaseClobRequestSlotFromConfig(response?.config);
+      return response;
+    },
     (error) => {
       try {
         const url = String(error?.config?.url || '');
@@ -496,6 +601,7 @@ const ensureAxiosRequestGuardInterceptor = (axiosInstance, host, currentKey) => 
       } catch {
         // ignore
       }
+      releaseClobRequestSlotFromConfig(error?.config);
       return Promise.reject(error);
     }
   );
@@ -1666,4 +1772,15 @@ module.exports = {
   redeemPolymarketWinnings,
   getClobRateLimitCooldownStatus,
   resetClobRateLimitCooldown,
+  __testOnly: {
+    withClobRequestSlot: async (host, fn) => {
+      const release = await acquireClobRequestSlot(host);
+      try {
+        return await fn();
+      } finally {
+        release();
+      }
+    },
+    resetClobExecutionRuntimeState,
+  },
 };

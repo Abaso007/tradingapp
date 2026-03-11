@@ -2,6 +2,7 @@ const {
   getPolymarketExecutionMode,
   getPolymarketExecutionDebugInfo,
   executePolymarketMarketOrder,
+  __testOnly,
 } = require('../polymarketExecutionService');
 
 const withEnv = async (env, fn) => {
@@ -26,6 +27,10 @@ const withEnv = async (env, fn) => {
 };
 
 describe('polymarketExecutionService', () => {
+  afterEach(() => {
+    __testOnly.resetClobExecutionRuntimeState();
+  });
+
   test('defaults to paper mode', () =>
     withEnv(
       {
@@ -84,4 +89,39 @@ describe('polymarketExecutionService', () => {
         });
       }
     ));
+
+  test('serializes clob requests through a single host-level slot by default', async () => {
+    const events = [];
+    let releaseFirst = null;
+    let secondStarted = false;
+
+    const firstStarted = new Promise((resolve) => {
+      __testOnly
+        .withClobRequestSlot('https://clob.polymarket.com', async () => {
+          events.push('first-start');
+          resolve();
+          await new Promise((resume) => {
+            releaseFirst = resume;
+          });
+          events.push('first-end');
+        })
+        .catch(() => {});
+    });
+
+    await firstStarted;
+
+    const secondTask = __testOnly.withClobRequestSlot('https://clob.polymarket.com', async () => {
+      secondStarted = true;
+      events.push('second-start');
+      events.push('second-end');
+    });
+
+    await new Promise((resolve) => setTimeout(resolve, 25));
+    expect(secondStarted).toBe(false);
+
+    releaseFirst();
+    await secondTask;
+
+    expect(events).toEqual(['first-start', 'first-end', 'second-start', 'second-end']);
+  });
 });
