@@ -1562,7 +1562,7 @@ jest.mock('../strategyLogger', () => ({
         address: '0x3333333333333333333333333333333333333333',
         backfillPending: false,
         lastTradeMatchTime: '1970-01-01T00:00:00.000Z',
-        lastTradeId: null,
+        lastTradeId: 'legacy-clob-id',
       },
     };
 
@@ -1572,8 +1572,11 @@ jest.mock('../strategyLogger', () => ({
     expect(updateOne).toHaveBeenCalledTimes(1);
 
     const update = updateOne.mock.calls[0][1];
-    expect(update.$set.stocks).toHaveLength(1);
-    expect(update.$set.stocks[0]._id).toEqual(stockSubdocId);
-    expect(update.$set.stocks[0]._id).not.toEqual({});
+    expect(update.$set['stocks.$[row0]']).toBeTruthy();
+    expect(update.$set['stocks.$[row0]']._id).toEqual(stockSubdocId);
+    expect(update.$set['stocks.$[row0]']._id).not.toEqual({});
+    expect(update.$set['polymarket.lastTradeId']).toBeNull();
+    expect(update.$set.polymarket).toBeUndefined();
+    expect(updateOne.mock.calls[0][2]?.arrayFilters).toEqual([{ 'row0.asset_id': 'asset-1' }]);
   });
 });

@@ -366,6 +366,19 @@ const isMongoObjectId = (value) =>
     value?.constructor?.name === 'ObjectId' ||
     typeof value?.toHexString === 'function'
   );
+const isPlainMongoObject = (value) =>
+  Boolean(value) &&
+  typeof value === 'object' &&
+  !Array.isArray(value) &&
+  !(value instanceof Date) &&
+  !isMongoObjectId(value);
+const estimateSerializedBytes = (value) => {
+  try {
+    return Buffer.byteLength(JSON.stringify(value), 'utf8');
+  } catch {
+    return null;
+  }
+};
 const toPlainMongoValue = (value) => {
   if (value === undefined) {
     return undefined;
@@ -394,13 +407,292 @@ const toPlainMongoValue = (value) => {
   });
   return next;
 };
+const areMongoValuesEqual = (left, right) => {
+  if (left === right) {
+    return true;
+  }
+  if (Number.isNaN(left) && Number.isNaN(right)) {
+    return true;
+  }
+  if (left === null || left === undefined || right === null || right === undefined) {
+    return left === right;
+  }
+  if (isMongoObjectId(left) || isMongoObjectId(right)) {
+    return isMongoObjectId(left) && isMongoObjectId(right) && String(left) === String(right);
+  }
+  if (left instanceof Date || right instanceof Date) {
+    return left instanceof Date && right instanceof Date && left.getTime() === right.getTime();
+  }
+  if (Array.isArray(left) || Array.isArray(right)) {
+    if (!Array.isArray(left) || !Array.isArray(right) || left.length !== right.length) {
+      return false;
+    }
+    for (let index = 0; index < left.length; index += 1) {
+      if (!areMongoValuesEqual(left[index], right[index])) {
+        return false;
+      }
+    }
+    return true;
+  }
+  if (isPlainMongoObject(left) || isPlainMongoObject(right)) {
+    if (!isPlainMongoObject(left) || !isPlainMongoObject(right)) {
+      return false;
+    }
+    const leftKeys = Object.keys(left);
+    const rightKeys = Object.keys(right);
+    if (leftKeys.length !== rightKeys.length) {
+      return false;
+    }
+    for (const key of leftKeys) {
+      if (!Object.prototype.hasOwnProperty.call(right, key)) {
+        return false;
+      }
+      if (!areMongoValuesEqual(left[key], right[key])) {
+        return false;
+      }
+    }
+    return true;
+  }
+  return false;
+};
+const ensureUpdateOperatorBucket = (updateDoc, operator) => {
+  if (!updateDoc[operator]) {
+    updateDoc[operator] = {};
+  }
+  return updateDoc[operator];
+};
+const addUpdateSet = (updateDoc, path, value) => {
+  ensureUpdateOperatorBucket(updateDoc, '$set')[path] = value;
+};
+const addUpdateUnset = (updateDoc, path) => {
+  ensureUpdateOperatorBucket(updateDoc, '$unset')[path] = 1;
+};
+const clonePolymarketWithoutSizingHoldings = (poly) => {
+  if (!isPlainMongoObject(poly)) {
+    return poly;
+  }
+  const next = { ...poly };
+  if (isPlainMongoObject(next.sizingState)) {
+    next.sizingState = { ...next.sizingState };
+    delete next.sizingState.holdings;
+  }
+  return next;
+};
+const collectMongoFieldDiff = (path, before, after, updateDoc) => {
+  if (!path) {
+    return;
+  }
+  if (after === undefined) {
+    if (before !== undefined) {
+      addUpdateUnset(updateDoc, path);
+    }
+    return;
+  }
+  if (before === undefined) {
+    addUpdateSet(updateDoc, path, after);
+    return;
+  }
+  if (areMongoValuesEqual(before, after)) {
+    return;
+  }
+  if (isPlainMongoObject(before) && isPlainMongoObject(after)) {
+    const keys = new Set([...Object.keys(before), ...Object.keys(after)]);
+    if (!keys.size) {
+      addUpdateSet(updateDoc, path, after);
+      return;
+    }
+    keys.forEach((key) => {
+      collectMongoFieldDiff(`${path}.${key}`, before[key], after[key], updateDoc);
+    });
+    return;
+  }
+  addUpdateSet(updateDoc, path, after);
+};
+const MAX_TARGETED_ARRAY_ROW_UPDATES = 50;
+const buildKeyedArrayUpdatePlan = ({
+  path,
+  previous,
+  next,
+  keyField,
+}) => {
+  const previousArray = Array.isArray(previous) ? previous.map((entry) => toPlainMongoValue(entry)) : [];
+  const nextArray = Array.isArray(next) ? next.map((entry) => toPlainMongoValue(entry)) : [];
+  const baseStats = {
+    mode: 'unchanged',
+    previousCount: previousArray.length,
+    nextCount: nextArray.length,
+    changedCount: 0,
+    addedCount: 0,
+    removedCount: 0,
+  };
+  if (areMongoValuesEqual(previousArray, nextArray)) {
+    return { stats: baseStats };
+  }
+  const previousMap = new Map();
+  const nextMap = new Map();
+  const collectRows = (entries, target) => {
+    for (const entry of entries) {
+      if (!isPlainMongoObject(entry)) {
+        return false;
+      }
+      const rawKey = entry?.[keyField];
+      const key = rawKey === null || rawKey === undefined || rawKey === '' ? null : String(rawKey);
+      if (!key || target.has(key)) {
+        return false;
+      }
+      target.set(key, entry);
+    }
+    return true;
+  };
+  if (!collectRows(previousArray, previousMap) || !collectRows(nextArray, nextMap)) {
+    return {
+      set: { [path]: nextArray },
+      stats: {
+        ...baseStats,
+        mode: 'replace',
+        changedCount: nextArray.length,
+        addedCount: Math.max(0, nextArray.length - previousArray.length),
+        removedCount: Math.max(0, previousArray.length - nextArray.length),
+      },
+    };
+  }
+
+  const changedEntries = [];
+  const addedEntries = [];
+  const removedKeys = [];
+
+  for (const [key, previousEntry] of previousMap.entries()) {
+    const nextEntry = nextMap.get(key);
+    if (!nextEntry) {
+      removedKeys.push(key);
+      continue;
+    }
+    if (!areMongoValuesEqual(previousEntry, nextEntry)) {
+      changedEntries.push(
+        previousEntry?._id !== undefined && nextEntry?._id === undefined
+          ? { ...nextEntry, _id: previousEntry._id }
+          : nextEntry
+      );
+    }
+  }
+  for (const [key, nextEntry] of nextMap.entries()) {
+    if (!previousMap.has(key)) {
+      addedEntries.push(nextEntry);
+    }
+  }
+
+  const stats = {
+    ...baseStats,
+    changedCount: changedEntries.length,
+    addedCount: addedEntries.length,
+    removedCount: removedKeys.length,
+  };
+
+  if (!changedEntries.length && !addedEntries.length && !removedKeys.length) {
+    return { stats };
+  }
+  if (!addedEntries.length && !removedKeys.length && changedEntries.length <= MAX_TARGETED_ARRAY_ROW_UPDATES) {
+    const set = {};
+    const arrayFilters = [];
+    changedEntries.forEach((entry, index) => {
+      const alias = `row${index}`;
+      set[`${path}.$[${alias}]`] = entry;
+      arrayFilters.push({ [`${alias}.${keyField}`]: String(entry[keyField]) });
+    });
+    return {
+      set,
+      arrayFilters,
+      stats: {
+        ...stats,
+        mode: 'in_place',
+      },
+    };
+  }
+  if (!changedEntries.length && addedEntries.length && !removedKeys.length) {
+    return {
+      push: { [path]: { $each: addedEntries } },
+      stats: {
+        ...stats,
+        mode: 'append',
+      },
+    };
+  }
+  if (!changedEntries.length && !addedEntries.length && removedKeys.length) {
+    return {
+      pull: { [path]: { [keyField]: { $in: removedKeys } } },
+      stats: {
+        ...stats,
+        mode: 'remove',
+      },
+    };
+  }
+  return {
+    set: { [path]: nextArray },
+    stats: {
+      ...stats,
+      mode: 'replace',
+    },
+  };
+};
+const applyUpdatePlan = (updateDoc, updateOptions, plan) => {
+  if (!plan) {
+    return;
+  }
+  if (plan.set) {
+    Object.entries(plan.set).forEach(([path, value]) => {
+      addUpdateSet(updateDoc, path, value);
+    });
+  }
+  if (plan.unset) {
+    Object.keys(plan.unset).forEach((path) => {
+      addUpdateUnset(updateDoc, path);
+    });
+  }
+  if (plan.push) {
+    Object.entries(plan.push).forEach(([path, value]) => {
+      ensureUpdateOperatorBucket(updateDoc, '$push')[path] = value;
+    });
+  }
+  if (plan.pull) {
+    Object.entries(plan.pull).forEach(([path, value]) => {
+      ensureUpdateOperatorBucket(updateDoc, '$pull')[path] = value;
+    });
+  }
+  if (Array.isArray(plan.arrayFilters) && plan.arrayFilters.length) {
+    updateOptions.arrayFilters = [...(updateOptions.arrayFilters || []), ...plan.arrayFilters];
+  }
+};
 const persistPolymarketPortfolioState = async (
   portfolio,
-  { includeStocks = true, includePolymarket = true } = {}
+  {
+    includeStocks = true,
+    includePolymarket = true,
+    previousStocks = null,
+    previousPolymarket = null,
+    logContext = null,
+    shouldLog = false,
+  } = {}
 ) => {
   if (!portfolio?._id) {
     await portfolio.save();
-    return;
+    return {
+      mode: 'document_save',
+      payloadBytes: null,
+      setPathCount: 0,
+      unsetPathCount: 0,
+      pushPathCount: 0,
+      pullPathCount: 0,
+      arrayFilterCount: 0,
+      stocksMode: includeStocks ? 'document_save' : 'skipped',
+      polymarketMode: includePolymarket ? 'document_save' : 'skipped',
+      stocksChangedCount: 0,
+      stocksAddedCount: 0,
+      stocksRemovedCount: 0,
+      sizingHoldingsMode: includePolymarket ? 'document_save' : 'skipped',
+      sizingHoldingsChangedCount: 0,
+      sizingHoldingsAddedCount: 0,
+      sizingHoldingsRemovedCount: 0,
+    };
   }
   const updateSet = {
     lastRebalancedAt: portfolio.lastRebalancedAt ?? null,
@@ -410,17 +702,106 @@ const persistPolymarketPortfolioState = async (
     retainedCash: toNumber(portfolio.retainedCash, 0) ?? 0,
     cashBuffer: toNumber(portfolio.cashBuffer, 0) ?? 0,
   };
+  const updateDoc = { $set: updateSet };
+  const updateOptions = {};
+  const stats = {
+    mode: 'targeted_update',
+    payloadBytes: null,
+    setPathCount: 0,
+    unsetPathCount: 0,
+    pushPathCount: 0,
+    pullPathCount: 0,
+    arrayFilterCount: 0,
+    stocksMode: includeStocks ? 'unchanged' : 'skipped',
+    polymarketMode: includePolymarket ? 'diff' : 'skipped',
+    stocksChangedCount: 0,
+    stocksAddedCount: 0,
+    stocksRemovedCount: 0,
+    sizingHoldingsMode: includePolymarket ? 'unchanged' : 'skipped',
+    sizingHoldingsChangedCount: 0,
+    sizingHoldingsAddedCount: 0,
+    sizingHoldingsRemovedCount: 0,
+  };
+
+  if (includeStocks) {
+    const stocksPlan = buildKeyedArrayUpdatePlan({
+      path: 'stocks',
+      previous: previousStocks,
+      next: Array.isArray(portfolio.stocks) ? portfolio.stocks : [],
+      keyField: 'asset_id',
+    });
+    applyUpdatePlan(updateDoc, updateOptions, stocksPlan);
+    stats.stocksMode = stocksPlan?.stats?.mode || 'unchanged';
+    stats.stocksChangedCount = stocksPlan?.stats?.changedCount || 0;
+    stats.stocksAddedCount = stocksPlan?.stats?.addedCount || 0;
+    stats.stocksRemovedCount = stocksPlan?.stats?.removedCount || 0;
+  }
   if (includePolymarket) {
     sanitizePolymarketSubdoc(portfolio);
-    updateSet.polymarket = toPlainMongoValue(snapshotPolymarket(portfolio.polymarket));
+    const previousPoly = toPlainMongoValue(previousPolymarket || {});
+    const nextPoly = toPlainMongoValue(snapshotPolymarket(portfolio.polymarket));
+    collectMongoFieldDiff(
+      'polymarket',
+      clonePolymarketWithoutSizingHoldings(previousPoly),
+      clonePolymarketWithoutSizingHoldings(nextPoly),
+      updateDoc
+    );
+    const sizingHoldingsPlan = buildKeyedArrayUpdatePlan({
+      path: 'polymarket.sizingState.holdings',
+      previous: previousPoly?.sizingState?.holdings,
+      next: nextPoly?.sizingState?.holdings,
+      keyField: 'asset_id',
+    });
+    applyUpdatePlan(updateDoc, updateOptions, sizingHoldingsPlan);
+    stats.sizingHoldingsMode = sizingHoldingsPlan?.stats?.mode || 'unchanged';
+    stats.sizingHoldingsChangedCount = sizingHoldingsPlan?.stats?.changedCount || 0;
+    stats.sizingHoldingsAddedCount = sizingHoldingsPlan?.stats?.addedCount || 0;
+    stats.sizingHoldingsRemovedCount = sizingHoldingsPlan?.stats?.removedCount || 0;
   }
-  if (includeStocks) {
-    updateSet.stocks = toPlainMongoValue(Array.isArray(portfolio.stocks) ? portfolio.stocks : []);
+
+  Object.keys(updateDoc).forEach((operator) => {
+    if (updateDoc[operator] && Object.keys(updateDoc[operator]).length === 0) {
+      delete updateDoc[operator];
+    }
+  });
+
+  stats.setPathCount = Object.keys(updateDoc.$set || {}).length;
+  stats.unsetPathCount = Object.keys(updateDoc.$unset || {}).length;
+  stats.pushPathCount = Object.keys(updateDoc.$push || {}).length;
+  stats.pullPathCount = Object.keys(updateDoc.$pull || {}).length;
+  stats.arrayFilterCount = Array.isArray(updateOptions.arrayFilters) ? updateOptions.arrayFilters.length : 0;
+  stats.payloadBytes = estimateSerializedBytes({ update: updateDoc, options: updateOptions });
+
+  if (shouldLog && process.env.NODE_ENV !== 'test') {
+    console.log('[Polymarket Save Payload]', {
+      portfolioId: logContext?.portfolioId || String(portfolio._id),
+      strategyId: logContext?.strategyId || null,
+      payloadBytes: stats.payloadBytes,
+      setPathCount: stats.setPathCount,
+      unsetPathCount: stats.unsetPathCount,
+      pushPathCount: stats.pushPathCount,
+      pullPathCount: stats.pullPathCount,
+      arrayFilterCount: stats.arrayFilterCount,
+      stocksMode: stats.stocksMode,
+      stocksChangedCount: stats.stocksChangedCount,
+      stocksAddedCount: stats.stocksAddedCount,
+      stocksRemovedCount: stats.stocksRemovedCount,
+      sizingHoldingsMode: stats.sizingHoldingsMode,
+      sizingHoldingsChangedCount: stats.sizingHoldingsChangedCount,
+      sizingHoldingsAddedCount: stats.sizingHoldingsAddedCount,
+      sizingHoldingsRemovedCount: stats.sizingHoldingsRemovedCount,
+    });
+  }
+
+  if (Object.keys(updateDoc).length === 0) {
+    return stats;
   }
   await Portfolio.updateOne(
     { _id: portfolio._id },
-    { $set: updateSet }
+    updateDoc,
+    updateOptions
   );
+  return stats;
 };
 
 const axiosGet = async (url, config = {}) => {
@@ -1231,6 +1612,8 @@ const syncPolymarketPortfolioInternal = async (portfolio, options = {}) => {
   sanitizePolymarketSubdoc(portfolio);
 
   const poly = portfolio.polymarket || {};
+  const initialPolymarketSnapshot = toPlainMongoValue(snapshotPolymarket(poly));
+  const initialStocksSnapshot = toPlainMongoValue(Array.isArray(portfolio.stocks) ? portfolio.stocks : []);
   const requestedMode = String(options?.mode || '').trim().toLowerCase();
   const shouldLogSyncTiming = process.env.NODE_ENV !== 'test';
   const syncStartedAtMs = Date.now();
@@ -2369,12 +2752,22 @@ const syncPolymarketPortfolioInternal = async (portfolio, options = {}) => {
     portfolio.lastPerformanceComputedAt = now;
     ensureStockOrderIds(currentHoldings);
     const savePortfolioStartedAtMs = Date.now();
-    await persistPolymarketPortfolioState(portfolio, {
+    const saveStats = await persistPolymarketPortfolioState(portfolio, {
       includeStocks: true,
-      includePolymarket: false,
+      includePolymarket: true,
+      previousStocks: initialStocksSnapshot,
+      previousPolymarket: initialPolymarketSnapshot,
+      shouldLog: shouldLogSyncTiming,
+      logContext: {
+        portfolioId: String(portfolio._id || ''),
+        strategyId: String(portfolio.strategy_id || ''),
+      },
     });
     notePhaseTiming('savePortfolio', savePortfolioStartedAtMs, {
       positionsCount: currentHoldings.length,
+      payloadBytes: saveStats.payloadBytes,
+      stocksMode: saveStats.stocksMode,
+      sizingHoldingsMode: saveStats.sizingHoldingsMode,
     });
     const recordEquityStartedAtMs = Date.now();
     await recordEquitySnapshotIfPossible({
@@ -4744,13 +5137,23 @@ const syncPolymarketPortfolioInternal = async (portfolio, options = {}) => {
       portfolio.polymarket = nextPoly;
     }
     const savePortfolioStartedAtMs = Date.now();
-    await persistPolymarketPortfolioState(portfolio, {
+    const saveStats = await persistPolymarketPortfolioState(portfolio, {
       includeStocks: shouldApplyPortfolioUpdate || liveHoldings.reconciledPortfolio === true,
       includePolymarket: true,
+      previousStocks: initialStocksSnapshot,
+      previousPolymarket: initialPolymarketSnapshot,
+      shouldLog: shouldLogSyncTiming,
+      logContext: {
+        portfolioId: String(portfolio._id || ''),
+        strategyId: String(portfolio.strategy_id || ''),
+      },
     });
     notePhaseTiming('savePortfolio', savePortfolioStartedAtMs, {
       positionsCount: Array.isArray(portfolio.stocks) ? portfolio.stocks.length : 0,
       portfolioUpdated: shouldApplyPortfolioUpdate,
+      payloadBytes: saveStats.payloadBytes,
+      stocksMode: saveStats.stocksMode,
+      sizingHoldingsMode: saveStats.sizingHoldingsMode,
     });
 
   const savedStocks = Array.isArray(portfolio.stocks) ? portfolio.stocks : [];
