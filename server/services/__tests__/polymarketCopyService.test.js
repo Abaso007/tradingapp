@@ -1504,4 +1504,76 @@ jest.mock('../strategyLogger', () => ({
     expect(result.processed).toBe(0);
     expect(portfolio.save).toHaveBeenCalled();
   });
+
+  it('preserves embedded stock object ids when using targeted portfolio updates', async () => {
+    process.env.POLYMARKET_TRADES_SOURCE = 'data-api';
+
+    const mongoose = require('mongoose');
+    const updateOne = jest.fn(async () => ({ acknowledged: true, matchedCount: 1, modifiedCount: 1 }));
+    jest.doMock('../../models/portfolioModel', () => ({
+      updateOne,
+    }));
+
+    const dataApi = nock('https://data-api.polymarket.com');
+    dataApi
+      .get('/trades')
+      .query(true)
+      .reply(200, []);
+
+    const clob = nock('https://clob.polymarket.com');
+    clob.get('/markets/cond-1').query(true).reply(200, {
+      tokens: [{ token_id: 'asset-1', price: 0.6, outcome: 'Yes' }],
+    });
+
+    const { syncPolymarketPortfolio } = require('../polymarketCopyService');
+
+    const stockSubdocId = new mongoose.Types.ObjectId();
+    const portfolioId = new mongoose.Types.ObjectId();
+    const portfolio = {
+      _id: portfolioId,
+      provider: 'polymarket',
+      userId: 'user-1',
+      strategy_id: 'strategy-1',
+      name: 'Polymarket Existing Holdings',
+      recurrence: 'every_minute',
+      stocks: [
+        {
+          _id: stockSubdocId,
+          symbol: 'PM:cond-1:Yes',
+          orderID: 'poly-asset-1',
+          market: 'cond-1',
+          asset_id: 'asset-1',
+          outcome: 'Yes',
+          avgCost: 0.5,
+          quantity: 2,
+          currentPrice: 0.5,
+        },
+      ],
+      retainedCash: 100,
+      cashBuffer: 100,
+      budget: 100,
+      cashLimit: 100,
+      initialInvestment: 100,
+      rebalanceCount: 0,
+      save: jest.fn(async () => {
+        throw new Error('expected targeted updateOne path');
+      }),
+      polymarket: {
+        address: '0x3333333333333333333333333333333333333333',
+        backfillPending: false,
+        lastTradeMatchTime: '1970-01-01T00:00:00.000Z',
+        lastTradeId: null,
+      },
+    };
+
+    const result = await syncPolymarketPortfolio(portfolio, { mode: 'incremental' });
+    expect(result.processed).toBe(0);
+    expect(portfolio.save).not.toHaveBeenCalled();
+    expect(updateOne).toHaveBeenCalledTimes(1);
+
+    const update = updateOne.mock.calls[0][1];
+    expect(update.$set.stocks).toHaveLength(1);
+    expect(update.$set.stocks[0]._id).toEqual(stockSubdocId);
+    expect(update.$set.stocks[0]._id).not.toEqual({});
+  });
 });

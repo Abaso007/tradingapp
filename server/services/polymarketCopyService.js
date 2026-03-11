@@ -359,11 +359,21 @@ const snapshotPolymarket = (poly) => {
   }
   return base;
 };
+const isMongoObjectId = (value) =>
+  Boolean(value) && (
+    value instanceof mongoose.Types.ObjectId ||
+    value?._bsontype === 'ObjectId' ||
+    value?.constructor?.name === 'ObjectId' ||
+    typeof value?.toHexString === 'function'
+  );
 const toPlainMongoValue = (value) => {
   if (value === undefined) {
     return undefined;
   }
   if (value === null || typeof value !== 'object') {
+    return value;
+  }
+  if (isMongoObjectId(value)) {
     return value;
   }
   if (value instanceof Date) {
