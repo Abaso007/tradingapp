@@ -68,6 +68,7 @@ function schedulePortfolioRebalances() {
         console.log('[Scheduler] Ran due portfolio rebalances:', {
           due: result.due,
           processed: result.processed,
+          concurrency: result.concurrency,
           checkedAt: result.checkedAt,
         });
       }

@@ -283,6 +283,72 @@ const portfolioSchema = new Schema({
         trim: true,
       },
     },
+    pendingLiveRebalance: {
+      updatedAt: {
+        type: String,
+        default: null,
+        trim: true,
+      },
+      nextRetryAt: {
+        type: String,
+        default: null,
+        trim: true,
+      },
+      orders: {
+        type: [
+          {
+            asset_id: {
+              type: String,
+              default: null,
+              trim: true,
+            },
+            market: {
+              type: String,
+              default: null,
+              trim: true,
+            },
+            outcome: {
+              type: String,
+              default: null,
+              trim: true,
+            },
+            side: {
+              type: String,
+              default: null,
+              trim: true,
+            },
+            amount: {
+              type: Number,
+              default: null,
+            },
+            price: {
+              type: Number,
+              default: null,
+            },
+            notional: {
+              type: Number,
+              default: null,
+            },
+            reason: {
+              type: String,
+              default: null,
+              trim: true,
+            },
+            error: {
+              type: String,
+              default: null,
+              trim: true,
+            },
+            retryAfter: {
+              type: String,
+              default: null,
+              trim: true,
+            },
+          },
+        ],
+        default: [],
+      },
+    },
   },
   alpaca: {
     executionMode: {

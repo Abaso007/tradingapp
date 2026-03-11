@@ -1261,6 +1261,95 @@ const syncPolymarketPortfolioInternal = async (portfolio, options = {}) => {
     return true;
   };
   pruneLiquidityBlocks();
+  const normalizePendingLiveRebalanceState = (state, atMs = Date.now()) => {
+    if (!state || typeof state !== 'object') {
+      return null;
+    }
+    const rawOrders = Array.isArray(state?.orders) ? state.orders : [];
+    const orders = rawOrders
+      .map((entry) => {
+        const assetId = String(entry?.asset_id || '').trim();
+        const side = String(entry?.side || '').trim().toUpperCase();
+        if (!assetId || (side !== 'BUY' && side !== 'SELL')) {
+          return null;
+        }
+        if (untradeableTokenIds.has(assetId)) {
+          return null;
+        }
+        const blockState = getLiquidityBlockState(assetId, atMs);
+        const blockedUntilMs =
+          side === 'BUY'
+            ? blockState.buyBlockedUntilMs
+            : blockState.sellBlockedUntilMs;
+        const retryAfterMs = (() => {
+          const stored = parseTimestampMs(entry?.retryAfter);
+          if (blockedUntilMs && stored) {
+            return Math.max(blockedUntilMs, stored);
+          }
+          return blockedUntilMs || stored || null;
+        })();
+        return {
+          asset_id: assetId,
+          market: entry?.market ? String(entry.market).trim() : null,
+          outcome: entry?.outcome ? String(entry.outcome).trim() : null,
+          side,
+          amount: roundToDecimals(toNumber(entry?.amount, null), 6),
+          price: roundToDecimals(toNumber(entry?.price, null), 6),
+          notional: roundToDecimals(toNumber(entry?.notional, null), 6),
+          reason: entry?.reason ? String(entry.reason).trim() : null,
+          error: entry?.error ? String(entry.error).trim() : null,
+          retryAfterMs,
+        };
+      })
+      .filter(Boolean);
+    if (!orders.length) {
+      return null;
+    }
+    const nextRetryAtMs = orders.reduce((best, entry) => {
+      if (!entry?.retryAfterMs) {
+        return best;
+      }
+      if (!best) {
+        return entry.retryAfterMs;
+      }
+      return Math.min(best, entry.retryAfterMs);
+    }, parseTimestampMs(state?.nextRetryAt));
+    return {
+      updatedAtMs: parseTimestampMs(state?.updatedAt),
+      nextRetryAtMs,
+      orders,
+    };
+  };
+  const buildPendingLiveRebalanceState = (orders, at = new Date()) => {
+    if (!Array.isArray(orders) || !orders.length) {
+      return null;
+    }
+    const nextRetryAtMs = orders.reduce((best, entry) => {
+      if (!entry?.retryAfterMs) {
+        return best;
+      }
+      if (!best) {
+        return entry.retryAfterMs;
+      }
+      return Math.min(best, entry.retryAfterMs);
+    }, null);
+    return {
+      updatedAt: at.toISOString(),
+      nextRetryAt: nextRetryAtMs ? new Date(nextRetryAtMs).toISOString() : null,
+      orders: orders.map((entry) => ({
+        asset_id: entry.asset_id,
+        market: entry.market || null,
+        outcome: entry.outcome || null,
+        side: entry.side || null,
+        amount: roundToDecimals(toNumber(entry.amount, null), 6),
+        price: roundToDecimals(toNumber(entry.price, null), 6),
+        notional: roundToDecimals(toNumber(entry.notional, null), 6),
+        reason: entry.reason || null,
+        error: entry.error || null,
+        retryAfter: entry.retryAfterMs ? new Date(entry.retryAfterMs).toISOString() : null,
+      })),
+    };
+  };
 
   const envExecutionMode = getPolymarketExecutionMode();
   const portfolioExecutionMode = normalizeExecutionModeOverride(poly.executionMode) || 'paper';
@@ -1413,7 +1502,15 @@ const syncPolymarketPortfolioInternal = async (portfolio, options = {}) => {
 	  const lastTradeId = poly.lastTradeId ? String(poly.lastTradeId).trim() : null;
 	  const lastTradeMatchTime = poly.lastTradeMatchTime ? String(poly.lastTradeMatchTime).trim() : null;
 	  const now = new Date();
+	  const nowMs = now.getTime();
 	  const anchorMatchTime = lastTradeMatchTime || now.toISOString();
+  const storedPendingLiveRebalance = normalizePendingLiveRebalanceState(poly?.pendingLiveRebalance, nowMs);
+  const shouldRetryStoredLiveRebalance =
+    mode === 'incremental' &&
+    executionMode === 'live' &&
+    sizeToBudget === true &&
+    Array.isArray(storedPendingLiveRebalance?.orders) &&
+    storedPendingLiveRebalance.orders.some((entry) => !entry?.retryAfterMs || entry.retryAfterMs <= nowMs);
 
 	  let autoRedeem = null;
 	  const autoRedeemEnabled = parseBoolean(process.env.POLYMARKET_AUTO_REDEEM, false);
@@ -2012,7 +2109,7 @@ const syncPolymarketPortfolioInternal = async (portfolio, options = {}) => {
     }).catch(() => {});
   }
 
-  if (!pendingTrades.length && !shouldSeedFromPositionsSnapshot) {
+  if (!pendingTrades.length && !shouldSeedFromPositionsSnapshot && !shouldRetryStoredLiveRebalance) {
     if (mode === 'backfill') {
       portfolio.polymarket = {
         ...snapshotPolymarket(portfolio.polymarket),
@@ -2466,6 +2563,39 @@ const syncPolymarketPortfolioInternal = async (portfolio, options = {}) => {
   let ignoredTradesCount = 0;
   let liveExecutionAbort = null;
   let liveExecutionConfigLogged = false;
+  const pendingLiveRebalanceOrders = [];
+  const addPendingLiveRebalanceOrder = ({
+    order,
+    amount,
+    reason,
+    error = null,
+    retryAfterMs = null,
+  } = {}) => {
+    const assetId = String(order?.assetId || '').trim();
+    const side = String(order?.side || '').trim().toUpperCase();
+    const normalizedReason = String(reason || '').trim();
+    if (!assetId || (side !== 'BUY' && side !== 'SELL') || normalizedReason === 'execution_skipped_untradeable_token') {
+      return;
+    }
+    const nextRetryAfterMs = Number.isFinite(retryAfterMs) && retryAfterMs > 0 ? retryAfterMs : null;
+    pendingLiveRebalanceOrders.push({
+      asset_id: assetId,
+      market: order?.market ? String(order.market) : null,
+      outcome: order?.outcome ? String(order.outcome) : null,
+      side,
+      amount: roundToDecimals(toNumber(amount, null), 6),
+      price: roundToDecimals(toNumber(order?.limitPrice ?? order?.price, null), 6),
+      notional: roundToDecimals(toNumber(order?.notional, null), 6),
+      reason: normalizedReason || null,
+      error: error ? String(error) : null,
+      retryAfterMs: nextRetryAfterMs,
+    });
+  };
+  const getClobRetryAfterMs = () => {
+    const status = typeof getClobRateLimitCooldownStatus === 'function' ? getClobRateLimitCooldownStatus() : null;
+    const remainingMs = Number(status?.remainingMs || 0);
+    return Number.isFinite(remainingMs) && remainingMs > 0 ? Date.now() + remainingMs : null;
+  };
 
   if (seededFromPositionsSnapshot) {
     ignoredTradesCount = processedTrades.length;
@@ -3666,7 +3796,7 @@ const syncPolymarketPortfolioInternal = async (portfolio, options = {}) => {
         }
         : null;
 
-    const applySkippedOrderToTarget = ({ order, amount, reason, error, diagnostics }) => {
+    const applySkippedOrderToTarget = ({ order, amount, reason, error, diagnostics, retryAfterMs = null }) => {
       const skippedNotional = roundToDecimals(order.notional, 6);
       if (skippedNotional !== null && skippedNotional > 0) {
         if (order.side === 'BUY') {
@@ -3734,6 +3864,13 @@ const syncPolymarketPortfolioInternal = async (portfolio, options = {}) => {
         error: String(error || reason || 'Skipped'),
         ...(diagnostics ? { diagnostics } : {}),
       });
+      addPendingLiveRebalanceOrder({
+        order,
+        amount,
+        reason,
+        error: String(error || reason || 'Skipped'),
+        retryAfterMs,
+      });
 	      rebalancePlan.skippedOrders += 1;
 	    };
 
@@ -3776,18 +3913,18 @@ const syncPolymarketPortfolioInternal = async (portfolio, options = {}) => {
             apiErrorLower.includes('error 1015') ||
             apiErrorLower.includes('rate limited');
 
-          if (noOrderbookDetected) {
-            noteUntradeableTokenId(order.assetId);
-            const diagnostics = buildRebalanceDiagnostics({ orderbook });
-            applySkippedOrderToTarget({
-              order,
-              amount,
-              reason: 'execution_skipped_untradeable_token',
-              error: String(orderbook.apiError || orderbook.error || 'No orderbook exists for token'),
-              diagnostics,
-            });
-            continue;
-          }
+            if (noOrderbookDetected) {
+              noteUntradeableTokenId(order.assetId);
+              const diagnostics = buildRebalanceDiagnostics({ orderbook });
+              applySkippedOrderToTarget({
+                order,
+                amount,
+                reason: 'execution_skipped_untradeable_token',
+                error: String(orderbook.apiError || orderbook.error || 'No orderbook exists for token'),
+                diagnostics,
+              });
+              continue;
+            }
 
           if (status === 403 || status === 408 || rateLimitedDetected || (Number.isFinite(status) && status >= 500)) {
             const diagnostics = buildRebalanceDiagnostics({ orderbook });
@@ -3824,12 +3961,14 @@ const syncPolymarketPortfolioInternal = async (portfolio, options = {}) => {
                 side: order.side,
                 reason: error,
               });
+              const liquidityState = getLiquidityBlockState(order.assetId);
 	            applySkippedOrderToTarget({
 	              order,
 	              amount,
 	              reason: 'execution_skipped_no_liquidity',
 	              error,
 	              diagnostics,
+                retryAfterMs: order.side === 'BUY' ? liquidityState.buyBlockedUntilMs : liquidityState.sellBlockedUntilMs,
 	            });
 	            continue;
 	          }
@@ -3853,12 +3992,14 @@ const syncPolymarketPortfolioInternal = async (portfolio, options = {}) => {
                   side: order.side,
                   reason: msg,
                 });
+                const liquidityState = getLiquidityBlockState(order.assetId);
 	              applySkippedOrderToTarget({
 	                order,
                 amount,
                 reason: 'execution_skipped_no_match',
                 error: msg,
                 diagnostics,
+                retryAfterMs: order.side === 'BUY' ? liquidityState.buyBlockedUntilMs : liquidityState.sellBlockedUntilMs,
               });
               continue;
             }
@@ -3879,6 +4020,13 @@ const syncPolymarketPortfolioInternal = async (portfolio, options = {}) => {
                 notional: roundToDecimals(order.notional, 6),
                 reason: 'execution_rate_limited',
                 error: liveExecutionAbort,
+              });
+              addPendingLiveRebalanceOrder({
+                order,
+                amount,
+                reason: 'execution_rate_limited',
+                error: liveExecutionAbort,
+                retryAfterMs: getClobRetryAfterMs(),
               });
               rebalancePlan.failedOrders += 1;
               break;
@@ -3925,6 +4073,12 @@ const syncPolymarketPortfolioInternal = async (portfolio, options = {}) => {
 		            reason: 'execution_retryable_error',
 		            error: liveExecutionAbort,
 		          });
+            addPendingLiveRebalanceOrder({
+              order,
+              amount,
+              reason: 'execution_retryable_error',
+              error: liveExecutionAbort,
+            });
 	          rebalancePlan.failedOrders += 1;
 	          break;
 	        } else {
@@ -3985,12 +4139,14 @@ const syncPolymarketPortfolioInternal = async (portfolio, options = {}) => {
                 side: order.side,
                 reason: liquidityError,
               });
+              const liquidityState = getLiquidityBlockState(order.assetId);
               applySkippedOrderToTarget({
                 order,
                 amount,
                 reason: 'execution_skipped_no_liquidity',
                 error: liquidityError,
                 diagnostics,
+                retryAfterMs: order.side === 'BUY' ? liquidityState.buyBlockedUntilMs : liquidityState.sellBlockedUntilMs,
               });
               continue;
             }
@@ -4001,12 +4157,14 @@ const syncPolymarketPortfolioInternal = async (portfolio, options = {}) => {
                 side: order.side,
                 reason: errorMessage,
               });
+              const liquidityState = getLiquidityBlockState(order.assetId);
               applySkippedOrderToTarget({
                 order,
                 amount,
                 reason: 'execution_skipped_no_match',
                 error: errorMessage,
                 diagnostics,
+                retryAfterMs: order.side === 'BUY' ? liquidityState.buyBlockedUntilMs : liquidityState.sellBlockedUntilMs,
               });
               continue;
             }
@@ -4022,6 +4180,12 @@ const syncPolymarketPortfolioInternal = async (portfolio, options = {}) => {
 		            error: errorMessage,
 		            ...(diagnostics ? { diagnostics } : {}),
 		          });
+		          addPendingLiveRebalanceOrder({
+                order,
+                amount,
+                reason: 'execution_failed',
+                error: errorMessage,
+              });
 		          rebalancePlan.failedOrders += 1;
 	          continue;
 	        }
@@ -4055,7 +4219,13 @@ const syncPolymarketPortfolioInternal = async (portfolio, options = {}) => {
 	            error: meta.error,
 	            success: meta.success,
 	          },
-	        });
+		        });
+        addPendingLiveRebalanceOrder({
+          order,
+          amount,
+          reason: 'execution_failed',
+          error: errorMessage,
+        });
 	        rebalancePlan.failedOrders += 1;
 
 	        if (statusCode === 401 || statusCode === 403) {
@@ -4092,6 +4262,27 @@ const syncPolymarketPortfolioInternal = async (portfolio, options = {}) => {
   };
 
   await executeSizeToBudgetRebalance();
+  const carriedPendingLiveRebalanceOrders =
+    pendingLiveRebalanceOrders.length === 0 &&
+    executionMode === 'live' &&
+    mode === 'incremental' &&
+    sizeToBudget === true &&
+    Array.isArray(storedPendingLiveRebalance?.orders) &&
+    storedPendingLiveRebalance.orders.length > 0 &&
+    Number(rebalancePlan?.successfulOrders || 0) === 0 &&
+    rebalancePlan?.reason !== 'already_in_sync'
+      ? normalizePendingLiveRebalanceState(
+          buildPendingLiveRebalanceState(storedPendingLiveRebalance.orders, now),
+          now.getTime()
+        )?.orders || []
+      : [];
+  const pendingLiveRebalanceState =
+    executionMode === 'live' && sizeToBudget === true
+      ? buildPendingLiveRebalanceState(
+          pendingLiveRebalanceOrders.length > 0 ? pendingLiveRebalanceOrders : carriedPendingLiveRebalanceOrders,
+          now
+        )
+      : null;
 
   if (lastProcessedTrade?.id) {
     portfolio.polymarket = {
@@ -4208,6 +4399,16 @@ const syncPolymarketPortfolioInternal = async (portfolio, options = {}) => {
           updatedAt: entry.updatedAtMs ? new Date(entry.updatedAtMs).toISOString() : null,
         })),
       };
+    }
+    if (pendingLiveRebalanceState) {
+      portfolio.polymarket = {
+        ...snapshotPolymarket(portfolio.polymarket),
+        pendingLiveRebalance: pendingLiveRebalanceState,
+      };
+    } else if (portfolio.polymarket?.pendingLiveRebalance) {
+      const nextPoly = snapshotPolymarket(portfolio.polymarket);
+      delete nextPoly.pendingLiveRebalance;
+      portfolio.polymarket = nextPoly;
     }
 
 	  sanitizePolymarketSubdoc(portfolio);
@@ -4345,6 +4546,14 @@ const syncPolymarketPortfolioInternal = async (portfolio, options = {}) => {
         lines.push(`• Latest failure: ${String(firstFailure.side).toUpperCase()} ${firstFailure.symbol} — ${firstFailure.error}.`);
       }
     }
+    if (pendingLiveRebalanceState?.orders?.length) {
+      const retryLabel = pendingLiveRebalanceState.nextRetryAt
+        ? new Date(pendingLiveRebalanceState.nextRetryAt).toLocaleString()
+        : null;
+      lines.push(
+        `• Pending live retries: ${pendingLiveRebalanceState.orders.length}${retryLabel ? ` · next retry ${retryLabel}` : ''}.`
+      );
+    }
 
     if (shouldApplyPortfolioUpdate === true) {
       lines.push('• Portfolio updated: yes.');
@@ -4424,6 +4633,8 @@ const syncPolymarketPortfolioInternal = async (portfolio, options = {}) => {
             },
 	            liveRebalancePlan: rebalancePlan,
 	            liveRebalancePreflight: executionPreflight,
+              retryingStoredLiveRebalance: shouldRetryStoredLiveRebalance,
+              pendingLiveRebalance: pendingLiveRebalanceState,
 	            autoRedeem,
 	            executionDebug,
 	            liveHoldings,

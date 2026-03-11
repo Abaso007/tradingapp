@@ -2251,6 +2251,12 @@ const REBALANCE_LOCK_TIMEOUT_MS = (() => {
   return raw;
 })();
 
+const REBALANCE_MAX_CONCURRENCY = (() => {
+  const raw = Number(process.env.REBALANCE_MAX_CONCURRENCY);
+  if (!Number.isFinite(raw) || raw <= 0) return 4;
+  return Math.max(1, Math.min(Math.floor(raw), 32));
+})();
+
 const withRebalanceLock = async (handler) => {
   if (rebalanceInProgress) {
     throw new Error('Rebalance already in progress');
@@ -2277,48 +2283,70 @@ const runDueRebalances = async () => {
   try {
     return await withRebalanceLock(async () => {
       const now = new Date();
-      const duePortfolios = await Portfolio.find({
+      let duePortfoliosQuery = Portfolio.find({
         recurrence: { $exists: true },
         $or: [
           { nextRebalanceAt: null },
           { nextRebalanceAt: { $lte: now } },
         ],
       });
+      if (duePortfoliosQuery && !Array.isArray(duePortfoliosQuery) && typeof duePortfoliosQuery.sort === 'function') {
+        duePortfoliosQuery = duePortfoliosQuery.sort({ nextRebalanceAt: 1, _id: 1 });
+      }
+      const duePortfolios = await duePortfoliosQuery;
 
       if (!Array.isArray(duePortfolios) || duePortfolios.length === 0) {
         return { ok: true, checkedAt: now.toISOString(), due: 0, processed: 0 };
       }
 
       let processed = 0;
-      for (const portfolio of duePortfolios) {
-        try {
-          const provider = String(portfolio.provider || 'alpaca');
-          if (provider === 'polymarket') {
-            await syncPolymarketPortfolio(portfolio, { skipIfLocked: true });
-          } else {
-            await rebalancePortfolio(portfolio);
+      let cursor = 0;
+      const workerCount = Math.max(1, Math.min(REBALANCE_MAX_CONCURRENCY, duePortfolios.length));
+      await Promise.all(
+        Array.from({ length: workerCount }, async () => {
+          while (true) {
+            const index = cursor;
+            cursor += 1;
+            if (index >= duePortfolios.length) {
+              return;
+            }
+            const portfolio = duePortfolios[index];
+            try {
+              const provider = String(portfolio.provider || 'alpaca');
+              if (provider === 'polymarket') {
+                await syncPolymarketPortfolio(portfolio, { skipIfLocked: true });
+              } else {
+                await rebalancePortfolio(portfolio);
+              }
+              processed += 1;
+            } catch (error) {
+              console.error(`[Rebalance] Failed for portfolio ${portfolio._id}:`, error.message);
+              const provider = String(portfolio.provider || 'alpaca');
+              await recordStrategyLog({
+                strategyId: portfolio.strategy_id,
+                userId: portfolio.userId,
+                strategyName: portfolio.name,
+                level: 'error',
+                message: provider === 'polymarket'
+                  ? 'Polymarket sync failed'
+                  : 'Portfolio rebalance failed',
+                details: {
+                  provider,
+                  error: error.message,
+                },
+              });
+            }
           }
-          processed += 1;
-        } catch (error) {
-          console.error(`[Rebalance] Failed for portfolio ${portfolio._id}:`, error.message);
-          const provider = String(portfolio.provider || 'alpaca');
-          await recordStrategyLog({
-            strategyId: portfolio.strategy_id,
-            userId: portfolio.userId,
-            strategyName: portfolio.name,
-            level: 'error',
-            message: provider === 'polymarket'
-              ? 'Polymarket sync failed'
-              : 'Portfolio rebalance failed',
-            details: {
-              provider,
-              error: error.message,
-            },
-          });
-        }
-      }
+        })
+      );
 
-      return { ok: true, checkedAt: now.toISOString(), due: duePortfolios.length, processed };
+      return {
+        ok: true,
+        checkedAt: now.toISOString(),
+        due: duePortfolios.length,
+        processed,
+        concurrency: workerCount,
+      };
     });
   } catch (error) {
     if (String(error?.message || '').includes('Rebalance already in progress')) {
