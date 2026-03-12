@@ -1347,28 +1347,41 @@ const fetchDataApiPositionsSnapshot = async ({ userAddress }) => {
     throw new Error('Polymarket address is missing or invalid.');
   }
 
-  const response = await polymarketAxiosGet(`${DATA_API_HOST}/positions`, {
-    headers: POLYMARKET_DATA_API_USER_AGENT ? { 'User-Agent': POLYMARKET_DATA_API_USER_AGENT } : undefined,
-    params: {
-      user: normalizedUser,
-    },
-  });
-
-  const data = Array.isArray(response?.data) ? response.data : [];
+  const pageSize = 100;
+  const maxRows = 5000;
   const normalizedPositions = [];
   const seen = new Set();
-  for (const raw of data) {
-    const mapped = normalizeDataApiPosition(raw);
-    if (!mapped?.asset_id || seen.has(mapped.asset_id)) {
-      continue;
+  let rawCount = 0;
+
+  for (let offset = 0; offset < maxRows; offset += pageSize) {
+    const response = await polymarketAxiosGet(`${DATA_API_HOST}/positions`, {
+      headers: POLYMARKET_DATA_API_USER_AGENT ? { 'User-Agent': POLYMARKET_DATA_API_USER_AGENT } : undefined,
+      params: {
+        user: normalizedUser,
+        limit: pageSize,
+        offset,
+      },
+    });
+
+    const data = Array.isArray(response?.data) ? response.data : [];
+    rawCount += data.length;
+    for (const raw of data) {
+      const mapped = normalizeDataApiPosition(raw);
+      if (!mapped?.asset_id || seen.has(mapped.asset_id)) {
+        continue;
+      }
+      seen.add(mapped.asset_id);
+      normalizedPositions.push(mapped);
     }
-    seen.add(mapped.asset_id);
-    normalizedPositions.push(mapped);
+
+    if (data.length < pageSize) {
+      break;
+    }
   }
 
   return {
     positions: normalizedPositions,
-    rawCount: data.length,
+    rawCount,
     proxyWallet: normalizedPositions.find((row) => row?.proxyWallet)?.proxyWallet || null,
   };
 };
@@ -2238,7 +2251,7 @@ const syncPolymarketPortfolioInternal = async (portfolio, options = {}) => {
     const state = poly?.sizingState || null;
     const holdings = Array.isArray(state?.holdings) ? state.holdings : [];
     const makerCash = toNumber(state?.makerCash, null);
-    return !Number.isFinite(makerCash) || holdings.length === 0;
+    return !holdings.length && !Number.isFinite(makerCash);
   })();
 
   const sizingStateMissing = POLYMARKET_SIZE_TO_BUDGET_BOOTSTRAP_ENABLED && makerStateMissing;
@@ -2254,8 +2267,8 @@ const syncPolymarketPortfolioInternal = async (portfolio, options = {}) => {
       ? 'backfill'
       : 'incremental';
 
-  const shouldSeedFromPositionsSnapshot =
-    mode === 'incremental' && sizeToBudget === true && seedFromPositions === true && makerStateMissing === true;
+  const shouldRefreshMakerStateFromPositionsSnapshot =
+    mode === 'incremental' && sizeToBudget === true && seedFromPositions === true;
 
   const allowLiveRebalanceDuringBackfill = parseBoolean(
     options?.allowLiveRebalanceDuringBackfill,
@@ -2953,7 +2966,12 @@ const syncPolymarketPortfolioInternal = async (portfolio, options = {}) => {
     return holdings.length > 0 || Number.isFinite(makerCash);
   })();
 
-  if (!pendingTrades.length && !shouldSeedFromPositionsSnapshot && !shouldRetryStoredLiveRebalance && !shouldApplyIdleSizeToBudget) {
+  if (
+    !pendingTrades.length &&
+    !shouldRefreshMakerStateFromPositionsSnapshot &&
+    !shouldRetryStoredLiveRebalance &&
+    !shouldApplyIdleSizeToBudget
+  ) {
     if (mode === 'backfill') {
       portfolio.polymarket = {
         ...snapshotPolymarket(portfolio.polymarket),
@@ -3193,8 +3211,8 @@ const syncPolymarketPortfolioInternal = async (portfolio, options = {}) => {
       const state = poly?.sizingState || {};
       const holdings = Array.isArray(state.holdings) ? state.holdings : [];
       const storedCash = toNumber(state.makerCash, null);
-      if (Number.isFinite(storedCash) && holdings.length) {
-        makerCash = storedCash;
+      if (Number.isFinite(storedCash) || holdings.length) {
+        makerCash = Number.isFinite(storedCash) ? storedCash : 0;
         holdings.forEach((row) => {
           const assetId = row?.asset_id ? String(row.asset_id) : null;
           if (!assetId) {
@@ -3244,10 +3262,12 @@ const syncPolymarketPortfolioInternal = async (portfolio, options = {}) => {
   let sizingMeta = null;
   let tradeScale = null;
   let seededFromPositionsSnapshot = false;
+  let refreshedMakerStateFromPositionsSnapshot = false;
+  let forceScaleResetFromPositionsSnapshot = false;
   const selectMakerValueForSizing = ({ makerCashValue, makerHoldingsValue }) => {
     const holdingsValue = Math.max(0, toNumber(makerHoldingsValue, 0));
     const walletCashValue = Math.max(0, toNumber(makerCashValue, 0));
-    if (sizeToBudgetBasis === 'positions' && holdingsValue > 0) {
+    if (sizeToBudgetBasis === 'positions') {
       return {
         scaleBasis: 'positions',
         makerValue: holdingsValue,
@@ -3291,86 +3311,91 @@ const syncPolymarketPortfolioInternal = async (portfolio, options = {}) => {
     };
   };
 
-  if (makerStateEnabled && !makerStateAvailable && seedFromPositions && mode === 'incremental') {
+  if (makerStateEnabled && shouldRefreshMakerStateFromPositionsSnapshot && (!processedTrades.length || !makerStateAvailable)) {
     const seedSnapshotStartedAtMs = Date.now();
+    const hadStoredMakerState = makerStateAvailable;
     try {
-    const sizingBudget = (() => {
-      const cashLimit = pickNumber(portfolio.cashLimit);
-      if (cashLimit !== null) {
-        return Math.max(0, cashLimit);
-      }
-      const budget = pickNumber(portfolio.budget);
-      if (budget !== null) {
-        return Math.max(0, budget);
-      }
-      const initialInvestment = pickNumber(portfolio.initialInvestment);
-      if (initialInvestment !== null) {
-        return Math.max(0, initialInvestment);
-      }
-      return Math.max(0, toNumber(startingCash, 0));
-    })();
+      const sizingBudget = (() => {
+        const cashLimit = pickNumber(portfolio.cashLimit);
+        if (cashLimit !== null) {
+          return Math.max(0, cashLimit);
+        }
+        const budget = pickNumber(portfolio.budget);
+        if (budget !== null) {
+          return Math.max(0, budget);
+        }
+        const initialInvestment = pickNumber(portfolio.initialInvestment);
+        if (initialInvestment !== null) {
+          return Math.max(0, initialInvestment);
+        }
+        return Math.max(0, toNumber(startingCash, 0));
+      })();
 
-    try {
-      const snapshot = await fetchMakerValueSnapshot();
-      const selectedSizingValue = selectMakerValueForSizing({
-        makerCashValue: snapshot?.makerCash,
-        makerHoldingsValue: snapshot?.makerHoldingsValue,
-      });
-      const makerValue = toNumber(selectedSizingValue?.makerValue, null);
-      const scale = makerValue && makerValue > 0 ? sizingBudget / makerValue : 0;
-
-      const positions = Array.isArray(snapshot?.positions) ? snapshot.positions : [];
-      const shouldSeedHoldings = positions.length > 0 || processedTrades.length === 0;
-
-      if (shouldSeedHoldings) {
-        makerCash = Math.max(0, toNumber(snapshot?.makerCash, 0));
-        makerHoldingsByAssetId.clear();
-        positions.forEach((pos) => {
-          const assetId = pos?.asset_id ? String(pos.asset_id) : null;
-          if (!assetId) {
-            return;
-          }
-          makerHoldingsByAssetId.set(assetId, {
-            market: pos?.market ? String(pos.market) : null,
-            asset_id: assetId,
-            outcome: pos?.outcome ? String(pos.outcome) : null,
-            quantity: toNumber(pos?.quantity, 0),
-            avgCost: toNumber(pos?.avgCost, null),
-            currentPrice: toNumber(pos?.currentPrice, null),
-          });
+      try {
+        const snapshot = await fetchMakerValueSnapshot();
+        const selectedSizingValue = selectMakerValueForSizing({
+          makerCashValue: snapshot?.makerCash,
+          makerHoldingsValue: snapshot?.makerHoldingsValue,
         });
-        makerStateAvailable = true;
-        seededFromPositionsSnapshot = true;
-      } else if (Number.isFinite(scale) && scale > 0) {
-        tradeScale = scale;
-      }
+        const makerValue = toNumber(selectedSizingValue?.makerValue, null);
+        const scale = makerValue && makerValue > 0 ? sizingBudget / makerValue : 0;
+        const positions = Array.isArray(snapshot?.positions) ? snapshot.positions : [];
+        const shouldAdoptSnapshotPositions = positions.length > 0 || processedTrades.length === 0;
 
-      sizingMeta = {
-        method: seededFromPositionsSnapshot ? 'positions-snapshot' : 'trade-scale',
-        source: snapshot?.source || null,
-        proxyWallet: snapshot?.proxyWallet || null,
-        chainId: snapshot?.chainId ?? null,
-        sizeToBudgetBasis,
-        scaleBasis: selectedSizingValue?.scaleBasis || null,
-        makerValue,
-        makerCash: snapshot?.makerCash ?? null,
-        makerHoldingsValue: snapshot?.makerHoldingsValue ?? null,
-        positionsCount: snapshot?.positionsCount ?? null,
-        sizingBudget,
-        scale,
-      };
-    } catch (error) {
-      sizingMeta = {
-        method: 'positions-snapshot',
-        source: 'data-api+onchain',
-        sizingBudget,
-        error: formatAxiosError(error),
-      };
-      tradeScale = null;
-    }
+        makerCash = Math.max(0, toNumber(snapshot?.makerCash, 0));
+        if (shouldAdoptSnapshotPositions) {
+          makerHoldingsByAssetId.clear();
+          positions.forEach((pos) => {
+            const assetId = pos?.asset_id ? String(pos.asset_id) : null;
+            if (!assetId) {
+              return;
+            }
+            makerHoldingsByAssetId.set(assetId, {
+              market: pos?.market ? String(pos.market) : null,
+              asset_id: assetId,
+              outcome: pos?.outcome ? String(pos.outcome) : null,
+              quantity: toNumber(pos?.quantity, 0),
+              avgCost: toNumber(pos?.avgCost, null),
+              currentPrice: toNumber(pos?.currentPrice, null),
+            });
+          });
+        }
+        makerStateAvailable = true;
+        seededFromPositionsSnapshot = !hadStoredMakerState && shouldAdoptSnapshotPositions;
+        refreshedMakerStateFromPositionsSnapshot = hadStoredMakerState && shouldAdoptSnapshotPositions;
+        forceScaleResetFromPositionsSnapshot = shouldAdoptSnapshotPositions && sizeToBudgetBasis === 'positions';
+
+        sizingMeta = {
+          method: shouldAdoptSnapshotPositions
+            ? hadStoredMakerState
+              ? 'positions-refresh'
+              : 'positions-snapshot'
+            : 'trade-scale',
+          source: snapshot?.source || null,
+          proxyWallet: snapshot?.proxyWallet || null,
+          chainId: snapshot?.chainId ?? null,
+          sizeToBudgetBasis,
+          scaleBasis: selectedSizingValue?.scaleBasis || null,
+          makerValue,
+          makerCash: snapshot?.makerCash ?? null,
+          makerHoldingsValue: snapshot?.makerHoldingsValue ?? null,
+          positionsCount: snapshot?.positionsCount ?? null,
+          sizingBudget,
+          scale,
+        };
+      } catch (error) {
+        sizingMeta = {
+          method: 'positions-snapshot',
+          source: 'data-api+onchain',
+          sizingBudget,
+          error: formatAxiosError(error),
+        };
+        tradeScale = null;
+      }
     } finally {
       notePhaseTiming('seedMakerState', seedSnapshotStartedAtMs, {
         seededFromPositionsSnapshot,
+        refreshedMakerStateFromPositionsSnapshot,
         makerStateAvailable,
         positionsCount: sizingMeta?.positionsCount ?? null,
         errored: Boolean(sizingMeta?.error),
@@ -3503,7 +3528,7 @@ const syncPolymarketPortfolioInternal = async (portfolio, options = {}) => {
   };
 
   const processTradesStartedAtMs = Date.now();
-  if (seededFromPositionsSnapshot) {
+  if (seededFromPositionsSnapshot && makerHoldingsByAssetId.size > 0) {
     ignoredTradesCount = processedTrades.length;
     if (processedTrades.length) {
       lastProcessedTrade = processedTrades[processedTrades.length - 1];
@@ -3990,6 +4015,93 @@ const syncPolymarketPortfolioInternal = async (portfolio, options = {}) => {
     liveExecutionAbort: Boolean(liveExecutionAbort),
   });
 
+  if (makerStateEnabled && shouldRefreshMakerStateFromPositionsSnapshot && processedTrades.length > 0 && !seededFromPositionsSnapshot) {
+    const refreshMakerStateStartedAtMs = Date.now();
+    const hadStoredMakerState = makerStateAvailable;
+    try {
+      const sizingBudget = (() => {
+        const cashLimit = pickNumber(portfolio.cashLimit);
+        if (cashLimit !== null) {
+          return Math.max(0, cashLimit);
+        }
+        const budget = pickNumber(portfolio.budget);
+        if (budget !== null) {
+          return Math.max(0, budget);
+        }
+        const initialInvestment = pickNumber(portfolio.initialInvestment);
+        if (initialInvestment !== null) {
+          return Math.max(0, initialInvestment);
+        }
+        return Math.max(0, toNumber(startingCash, 0));
+      })();
+
+      try {
+        const snapshot = await fetchMakerValueSnapshot();
+        const positions = Array.isArray(snapshot?.positions) ? snapshot.positions : [];
+        if (positions.length > 0) {
+          const selectedSizingValue = selectMakerValueForSizing({
+            makerCashValue: snapshot?.makerCash,
+            makerHoldingsValue: snapshot?.makerHoldingsValue,
+          });
+          const makerValue = toNumber(selectedSizingValue?.makerValue, null);
+          const scale = makerValue && makerValue > 0 ? sizingBudget / makerValue : 0;
+
+          makerCash = Math.max(0, toNumber(snapshot?.makerCash, 0));
+          makerHoldingsByAssetId.clear();
+          positions.forEach((pos) => {
+            const assetId = pos?.asset_id ? String(pos.asset_id) : null;
+            if (!assetId) {
+              return;
+            }
+            makerHoldingsByAssetId.set(assetId, {
+              market: pos?.market ? String(pos.market) : null,
+              asset_id: assetId,
+              outcome: pos?.outcome ? String(pos.outcome) : null,
+              quantity: toNumber(pos?.quantity, 0),
+              avgCost: toNumber(pos?.avgCost, null),
+              currentPrice: toNumber(pos?.currentPrice, null),
+            });
+          });
+          makerStateAvailable = true;
+          refreshedMakerStateFromPositionsSnapshot = hadStoredMakerState || refreshedMakerStateFromPositionsSnapshot;
+          forceScaleResetFromPositionsSnapshot = sizeToBudgetBasis === 'positions';
+
+          sizingMeta = {
+            method: hadStoredMakerState ? 'positions-refresh' : 'positions-snapshot',
+            source: snapshot?.source || null,
+            proxyWallet: snapshot?.proxyWallet || null,
+            chainId: snapshot?.chainId ?? null,
+            sizeToBudgetBasis,
+            scaleBasis: selectedSizingValue?.scaleBasis || null,
+            makerValue,
+            makerCash: snapshot?.makerCash ?? null,
+            makerHoldingsValue: snapshot?.makerHoldingsValue ?? null,
+            positionsCount: snapshot?.positionsCount ?? null,
+            sizingBudget,
+            scale,
+          };
+        }
+      } catch (error) {
+        if (!sizingMeta?.error) {
+          sizingMeta = {
+            method: 'positions-refresh',
+            source: 'data-api+onchain',
+            sizingBudget,
+            error: formatAxiosError(error),
+          };
+        }
+      }
+    } finally {
+      notePhaseTiming('refreshMakerState', refreshMakerStateStartedAtMs, {
+        seededFromPositionsSnapshot,
+        refreshedMakerStateFromPositionsSnapshot,
+        makerStateAvailable,
+        positionsCount: sizingMeta?.positionsCount ?? null,
+        errored: Boolean(sizingMeta?.error),
+      });
+    }
+  }
+
   let updatedStocks = [];
   let rebalancePlan = null;
   let executionPreflight = null;
@@ -4066,6 +4178,7 @@ const syncPolymarketPortfolioInternal = async (portfolio, options = {}) => {
     const storedScaleBudget = toNumber(existingSizingState?.scaleBudget, null);
     const storedScaleBasis = normalizeSizeToBudgetBasis(existingSizingState?.scaleBasis, null);
     const shouldResetScale =
+      forceScaleResetFromPositionsSnapshot ||
       !Number.isFinite(storedScale) ||
       storedScale <= 0 ||
       storedScaleBudget === null ||
@@ -5670,12 +5783,13 @@ const syncPolymarketPortfolioInternal = async (portfolio, options = {}) => {
       clobAuthCooldown: getClobAuthCooldownStatus(),
       clobRateLimitCooldown: typeof getClobRateLimitCooldownStatus === 'function' ? getClobRateLimitCooldownStatus() : null,
       sizeToBudget: makerStateEnabled,
-              sizeToBudgetBasis,
-      sizedToBudget: didSize,
-      seedFromPositions,
+            sizeToBudgetBasis,
+            sizedToBudget: didSize,
+            seedFromPositions,
             seededFromPositionsSnapshot,
+            refreshedMakerStateFromPositionsSnapshot,
             ignoredTrades: ignoredTradesCount,
-			      sizing: sizingMeta,
+				      sizing: sizingMeta,
             liveRebalanceConfig: {
               minNotional: POLYMARKET_LIVE_REBALANCE_MIN_NOTIONAL,
               maxOrders: POLYMARKET_LIVE_REBALANCE_MAX_ORDERS,

@@ -323,8 +323,8 @@ jest.mock('../strategyLogger', () => ({
     const result = await syncPolymarketPortfolio(portfolio, { mode: 'incremental' });
     expect(result.mode).toBe('incremental');
     expect(portfolio.stocks).toHaveLength(1);
-    expect(portfolio.stocks[0].quantity).toBeCloseTo(20, 6);
-    expect(portfolio.retainedCash).toBeCloseTo(90, 6);
+    expect(portfolio.stocks[0].quantity).toBeCloseTo(200, 6);
+    expect(portfolio.retainedCash).toBeCloseTo(0, 6);
     expect(dataApi.isDone()).toBe(true);
   });
 
@@ -413,6 +413,139 @@ jest.mock('../strategyLogger', () => ({
     expect(portfolio.stocks[0].quantity).toBeCloseTo(200, 6);
     expect(portfolio.retainedCash).toBeCloseTo(0, 6);
     expect(portfolio.polymarket?.sizingState?.scaleBasis).toBe('positions');
+  });
+
+  it('refreshes size-to-budget maker state from paginated open positions and drops stale holdings', async () => {
+    const makerAddress = '0x3333333333333333333333333333333333333333';
+    const freshSizingStateAt = new Date().toISOString();
+
+    process.env.POLYMARKET_TRADES_SOURCE = 'data-api';
+    process.env.POLYMARKET_SIZE_TO_BUDGET_BASIS = 'positions';
+    process.env.POLYMARKET_HOLDINGS_PRICE_REFRESH_MAX_AGE_MS = '3600000';
+
+    const executionModulePath = require.resolve('../polymarketExecutionService');
+    jest.doMock(executionModulePath, () => ({
+      getPolymarketExecutionMode: jest.fn(() => 'paper'),
+      executePolymarketMarketOrder: jest.fn(async () => {
+        throw new Error('should not execute in paper mode');
+      }),
+      getPolymarketExecutionDebugInfo: jest.fn(() => null),
+      getPolymarketBalanceAllowance: jest.fn(async () => ({ source: 'onchain', balance: 0, allowance: 0 })),
+      getPolymarketClobBalanceAllowance: jest.fn(async () => ({ source: 'clob-l2', balance: 0, allowance: 0 })),
+      getPolymarketOnchainUsdcBalance: jest.fn(async (address) => ({
+        source: 'onchain',
+        chainId: 137,
+        rpcUrl: 'https://polygon-rpc.com',
+        address,
+        collateral: '0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174',
+        balance: 500000,
+      })),
+    }));
+
+    const positionsPageOne = Array.from({ length: 100 }, (_, idx) => ({
+      proxyWallet: makerAddress,
+      asset: `asset-${idx}`,
+      conditionId: `cond-${idx}`,
+      outcome: 'Yes',
+      size: 1,
+      avgPrice: 1,
+      curPrice: 1,
+      currentValue: 1,
+    }));
+    const positionsPageTwo = [
+      {
+        proxyWallet: makerAddress,
+        asset: 'asset-100',
+        conditionId: 'cond-100',
+        outcome: 'Yes',
+        size: 50,
+        avgPrice: 1,
+        curPrice: 1,
+        currentValue: 50,
+      },
+    ];
+
+    const dataApi = nock('https://data-api.polymarket.com');
+    dataApi
+      .get('/positions')
+      .query((query) => query.user === makerAddress && Number(query.limit) === 100 && Number(query.offset) === 0)
+      .reply(200, positionsPageOne);
+    dataApi
+      .get('/positions')
+      .query((query) => query.user === makerAddress && Number(query.limit) === 100 && Number(query.offset) === 100)
+      .reply(200, positionsPageTwo);
+    dataApi
+      .get('/trades')
+      .query(true)
+      .reply(200, []);
+
+    const { syncPolymarketPortfolio } = require('../polymarketCopyService');
+
+    const portfolio = {
+      provider: 'polymarket',
+      userId: 'user-1',
+      strategy_id: 'strategy-refresh-open-positions',
+      name: 'Polymarket Refresh Open Positions',
+      recurrence: 'every_minute',
+      stocks: [
+        {
+          symbol: 'PM:stale:Yes',
+          orderID: 'poly-size-stale',
+          market: 'cond-stale',
+          asset_id: 'asset-stale',
+          outcome: 'Yes',
+          avgCost: 1,
+          quantity: 1000,
+          currentPrice: 1,
+        },
+      ],
+      retainedCash: 0,
+      cashBuffer: 0,
+      budget: 100,
+      cashLimit: 100,
+      initialInvestment: 100,
+      rebalanceCount: 0,
+      save: jest.fn(async () => {}),
+      polymarket: {
+        address: makerAddress,
+        sizeToBudget: true,
+        seedFromPositions: true,
+        backfillPending: false,
+        lastTradeMatchTime: '1970-01-01T00:00:00.000Z',
+        lastTradeId: null,
+        sizingState: {
+          makerCash: 500000,
+          holdings: [
+            {
+              market: 'cond-stale',
+              asset_id: 'asset-stale',
+              outcome: 'Yes',
+              quantity: 1000,
+              avgCost: 1,
+              currentPrice: 1,
+            },
+          ],
+          scale: 0.1,
+          scaleBasis: 'positions',
+          scaleBudget: 100,
+          scaleMakerValue: 1000,
+          lastUpdatedAt: freshSizingStateAt,
+        },
+      },
+    };
+
+    const result = await syncPolymarketPortfolio(portfolio, { mode: 'incremental' });
+    expect(result.mode).toBe('incremental');
+    expect(dataApi.isDone()).toBe(true);
+    expect(portfolio.polymarket?.sizingState?.scaleMakerValue).toBeCloseTo(150, 6);
+    expect(portfolio.polymarket?.sizingState?.scale).toBeCloseTo(100 / 150, 6);
+    expect(portfolio.polymarket?.sizingState?.holdings).toHaveLength(101);
+    expect(portfolio.polymarket?.sizingState?.holdings.some((row) => row.asset_id === 'asset-stale')).toBe(false);
+    expect(portfolio.stocks).toHaveLength(101);
+    expect(portfolio.stocks.some((row) => row.asset_id === 'asset-stale')).toBe(false);
+    const largePosition = portfolio.stocks.find((row) => row.asset_id === 'asset-100');
+    expect(largePosition?.quantity).toBeCloseTo(100 / 3, 6);
+    expect(portfolio.retainedCash).toBeCloseTo(0, 6);
   });
 
   it('resets legacy size-to-budget scales that were saved without a basis', async () => {
