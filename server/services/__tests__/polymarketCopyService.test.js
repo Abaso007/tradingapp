@@ -205,14 +205,14 @@ jest.mock('../strategyLogger', () => ({
         },
       ]);
 
-    const clob = nock('https://clob.polymarket.com');
-    clob.get('/markets/cond-1').query(true).reply(200, {
-      tokens: [{ token_id: 'asset-1', price: 0.5, outcome: 'Yes' }],
-    });
+	    const clob = nock('https://clob.polymarket.com');
+	    clob.get('/markets/cond-1').query(true).reply(200, {
+	      tokens: [{ token_id: 'asset-1', price: 0.5, outcome: 'Yes' }],
+	    });
 
-    const { syncPolymarketPortfolio } = require('../polymarketCopyService');
+	    const { syncPolymarketPortfolio } = require('../polymarketCopyService');
 
-    const portfolio = {
+	    const portfolio = {
       provider: 'polymarket',
       userId: 'user-1',
       strategy_id: 'strategy-1',
@@ -294,12 +294,13 @@ jest.mock('../strategyLogger', () => ({
       tokens: [{ token_id: 'asset-1', price: 0.5, outcome: 'Yes' }],
     });
 
-    const { syncPolymarketPortfolio } = require('../polymarketCopyService');
+	    const { syncPolymarketPortfolio } = require('../polymarketCopyService');
+	    const { recordStrategyLog } = require('../strategyLogger');
 
-    const portfolio = {
-      provider: 'polymarket',
-      userId: 'user-1',
-      strategy_id: 'strategy-1',
+	    const portfolio = {
+	      provider: 'polymarket',
+	      userId: 'user-1',
+	      strategy_id: 'strategy-1',
       name: 'Polymarket Trade Scale',
       recurrence: 'every_minute',
       stocks: [],
@@ -320,13 +321,15 @@ jest.mock('../strategyLogger', () => ({
       },
     };
 
-    const result = await syncPolymarketPortfolio(portfolio, { mode: 'incremental' });
-    expect(result.mode).toBe('incremental');
-    expect(portfolio.stocks).toHaveLength(1);
-    expect(portfolio.stocks[0].quantity).toBeCloseTo(200, 6);
-    expect(portfolio.retainedCash).toBeCloseTo(0, 6);
-    expect(dataApi.isDone()).toBe(true);
-  });
+	    const result = await syncPolymarketPortfolio(portfolio, { mode: 'incremental' });
+	    const lastLog = recordStrategyLog.mock.calls[recordStrategyLog.mock.calls.length - 1]?.[0] || null;
+	    expect(result.mode).toBe('incremental');
+	    expect(portfolio.stocks).toHaveLength(1);
+	    expect(portfolio.stocks[0].quantity).toBeCloseTo(200, 6);
+	    expect(portfolio.retainedCash).toBeCloseTo(0, 6);
+	    expect(lastLog?.details?.humanSummary).toContain('Copy threshold: copied order min $1.00 · maker trade min $100.00.');
+	    expect(dataApi.isDone()).toBe(true);
+	  });
 
   it('sizes seeded holdings against open positions instead of unrelated maker wallet cash', async () => {
     const makerAddress = '0x3333333333333333333333333333333333333333';

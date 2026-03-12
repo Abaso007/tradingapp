@@ -5626,8 +5626,8 @@ const syncPolymarketPortfolioInternal = async (portfolio, options = {}) => {
       return rounded === null ? String(num) : String(rounded);
     };
 
-    if (makerStateEnabled === true) {
-      const segments = [];
+	    if (makerStateEnabled === true) {
+	      const segments = [];
       if (sizingMeta?.sizingBudget !== undefined && sizingMeta?.sizingBudget !== null) {
         const label = formatUsd(sizingMeta.sizingBudget);
         if (label) segments.push(`budget ${label}`);
@@ -5642,11 +5642,31 @@ const syncPolymarketPortfolioInternal = async (portfolio, options = {}) => {
       if (sizingMeta?.makerValue !== undefined && sizingMeta?.makerValue !== null) {
         const label = formatUsd(sizingMeta.makerValue);
         if (label) segments.push(`maker value ${label}`);
-      }
-      lines.push(`• Size-to-budget: ON${segments.length ? ` (${segments.join(' · ')})` : ''}.`);
-    }
+	      }
+	      lines.push(`• Size-to-budget: ON${segments.length ? ` (${segments.join(' · ')})` : ''}.`);
+	    }
 
-    const buysCount = Array.isArray(tradeSummary?.buys) ? tradeSummary.buys.length : 0;
+	    const copiedOrderMinNotional = toNumber(POLYMARKET_LIVE_REBALANCE_MIN_NOTIONAL, null);
+	    const currentScale = toNumber(sizingMeta?.scale, null);
+	    const minimumMakerTrade = copiedOrderMinNotional !== null && currentScale && currentScale > 0
+	      ? copiedOrderMinNotional / currentScale
+	      : null;
+	    if (copiedOrderMinNotional !== null || minimumMakerTrade !== null) {
+	      const segments = [];
+	      const copiedLabel = formatUsd(copiedOrderMinNotional);
+	      if (copiedLabel) {
+	        segments.push(`copied order min ${copiedLabel}`);
+	      }
+	      const makerLabel = formatUsd(minimumMakerTrade);
+	      if (makerLabel) {
+	        segments.push(`maker trade min ${makerLabel}`);
+	      }
+	      if (segments.length) {
+	        lines.push(`• Copy threshold: ${segments.join(' · ')}.`);
+	      }
+	    }
+
+	    const buysCount = Array.isArray(tradeSummary?.buys) ? tradeSummary.buys.length : 0;
     const sellsCount = Array.isArray(tradeSummary?.sells) ? tradeSummary.sells.length : 0;
     if (buysCount || sellsCount) {
       lines.push(

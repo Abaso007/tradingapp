@@ -576,10 +576,19 @@ const buildPolymarketHumanSummary = (details) => {
   const portfolioUpdated =
     details.portfolioUpdated === true ? "yes" : details.portfolioUpdated === false ? "no" : null;
 
-  const sizing = details.sizing && typeof details.sizing === "object" ? details.sizing : null;
-  const scale = sizing?.scale;
-  const sizingBudget = sizing?.sizingBudget;
-  const makerValue = sizing?.makerValue;
+	  const sizing = details.sizing && typeof details.sizing === "object" ? details.sizing : null;
+	  const scale = sizing?.scale;
+	  const sizingBudget = sizing?.sizingBudget;
+	  const makerValue = sizing?.makerValue;
+	  const liveRebalanceConfig =
+	    details.liveRebalanceConfig && typeof details.liveRebalanceConfig === "object"
+	      ? details.liveRebalanceConfig
+	      : null;
+	  const copiedOrderMinNotional = liveRebalanceConfig?.minNotional;
+	  const minimumMakerTrade =
+	    Number.isFinite(Number(copiedOrderMinNotional)) && Number.isFinite(Number(scale)) && Number(scale) > 0
+	      ? Number(copiedOrderMinNotional) / Number(scale)
+	      : null;
 
   const makerBuys = Array.isArray(details.buys) ? details.buys : [];
   const makerSells = Array.isArray(details.sells) ? details.sells : [];
@@ -606,19 +615,32 @@ const buildPolymarketHumanSummary = (details) => {
     lines.push(`• ${modeParts.join(" · ")}.`);
   }
 
-  if (details.sizeToBudget === true) {
-    const segments = [];
-    if (sizingBudget != null) segments.push(`budget ${formatCurrency(sizingBudget)}`);
-    if (scale != null) segments.push(`scale ${formatNumber(scale, 8)}`);
-    if (makerValue != null) segments.push(`maker value ${formatCurrency(makerValue)}`);
+	  if (details.sizeToBudget === true) {
+	    const segments = [];
+	    if (sizingBudget != null) segments.push(`budget ${formatCurrency(sizingBudget)}`);
+	    if (scale != null) segments.push(`scale ${formatNumber(scale, 8)}`);
+	    if (makerValue != null) segments.push(`maker value ${formatCurrency(makerValue)}`);
     if (segments.length) {
       lines.push(`• Size-to-budget: ON (${segments.join(" · ")}).`);
     } else {
-      lines.push("• Size-to-budget: ON.");
-    }
-  }
+	      lines.push("• Size-to-budget: ON.");
+	    }
+	  }
 
-  if (buyCount || sellCount) {
+	  if (copiedOrderMinNotional != null || minimumMakerTrade != null) {
+	    const segments = [];
+	    if (copiedOrderMinNotional != null) {
+	      segments.push(`copied order min ${formatCurrency(copiedOrderMinNotional)}`);
+	    }
+	    if (minimumMakerTrade != null) {
+	      segments.push(`maker trade min ${formatCurrency(minimumMakerTrade)}`);
+	    }
+	    if (segments.length) {
+	      lines.push(`• Copy threshold: ${segments.join(" · ")}.`);
+	    }
+	  }
+
+	  if (buyCount || sellCount) {
     lines.push(
       details.sizeToBudget === true
         ? `• Maker trades ingested: buys ${buyCount} · sells ${sellCount}.`
