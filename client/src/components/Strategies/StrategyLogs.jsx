@@ -584,10 +584,9 @@ const buildPolymarketHumanSummary = (details) => {
 	    details.liveRebalanceConfig && typeof details.liveRebalanceConfig === "object"
 	      ? details.liveRebalanceConfig
 	      : null;
-	  const copiedOrderMinNotional = liveRebalanceConfig?.minNotional;
 	  const minimumMakerTrade =
-	    Number.isFinite(Number(copiedOrderMinNotional)) && Number.isFinite(Number(scale)) && Number(scale) > 0
-	      ? Number(copiedOrderMinNotional) / Number(scale)
+	    Number.isFinite(Number(liveRebalanceConfig?.minNotional)) && Number.isFinite(Number(scale)) && Number(scale) > 0
+	      ? Number(liveRebalanceConfig.minNotional) / Number(scale)
 	      : null;
 
   const makerBuys = Array.isArray(details.buys) ? details.buys : [];
@@ -627,17 +626,8 @@ const buildPolymarketHumanSummary = (details) => {
 	    }
 	  }
 
-	  if (copiedOrderMinNotional != null || minimumMakerTrade != null) {
-	    const segments = [];
-	    if (copiedOrderMinNotional != null) {
-	      segments.push(`copied order min ${formatCurrency(copiedOrderMinNotional)}`);
-	    }
-	    if (minimumMakerTrade != null) {
-	      segments.push(`maker trade min ${formatCurrency(minimumMakerTrade)}`);
-	    }
-	    if (segments.length) {
-	      lines.push(`• Copy threshold: ${segments.join(" · ")}.`);
-	    }
+	  if (minimumMakerTrade != null) {
+	    lines.push(`• Copy threshold: maker trade min ${formatCurrency(minimumMakerTrade)}.`);
 	  }
 
 	  if (buyCount || sellCount) {

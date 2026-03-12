@@ -1892,8 +1892,8 @@ const syncPolymarketPortfolioInternal = async (portfolio, options = {}) => {
         ...(entry.meta ? { meta: entry.meta } : {}),
       })),
   });
-  const buildTimingSummaryLine = (timings) => {
-    const summary = timings && typeof timings === 'object' ? timings : null;
+	  const buildTimingSummaryLine = (timings) => {
+	    const summary = timings && typeof timings === 'object' ? timings : null;
     if (!summary || !Array.isArray(summary.phases)) {
       return null;
     }
@@ -1903,27 +1903,46 @@ const syncPolymarketPortfolioInternal = async (portfolio, options = {}) => {
       .map((entry) => `${entry.phase} ${formatTimingDuration(entry.totalMs)}`);
     if (!topPhases.length && Number(summary.totalMs || 0) <= 0) {
       return null;
-    }
-    return `• Timing: total ${formatTimingDuration(summary.totalMs)}${topPhases.length ? ` · ${topPhases.join(' · ')}` : ''}.`;
-  };
-  const finalizeSyncResult = (result, timings = buildTimingSummary()) => {
-    const timingSummary = timings && typeof timings === 'object' ? timings : buildTimingSummary();
-    if (shouldLogSyncTiming) {
-      console.log('[Polymarket Sync Timing]', {
-        portfolioId: portfolio?._id ? String(portfolio._id) : null,
-        strategyId: portfolio?.strategy_id ? String(portfolio.strategy_id) : null,
-        mode: result?.mode ?? null,
-        tradeSource: result?.tradeSource ?? null,
+	    }
+	    return `• Timing: total ${formatTimingDuration(summary.totalMs)}${topPhases.length ? ` · ${topPhases.join(' · ')}` : ''}.`;
+	  };
+	  const formatUsdLabel = (value) => {
+	    const num = toNumber(value, null);
+	    if (num === null) return null;
+	    try {
+	      return `$${num.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+	    } catch {
+	      return `$${num.toFixed(2)}`;
+	    }
+	  };
+	  const getMakerTradeMinLabel = () => {
+	    const minNotional = toNumber(POLYMARKET_LIVE_REBALANCE_MIN_NOTIONAL, null);
+	    const scale = toNumber(portfolio?.polymarket?.sizingState?.scale, null);
+	    if (minNotional === null || scale === null || scale <= 0) {
+	      return null;
+	    }
+	    return formatUsdLabel(minNotional / scale);
+	  };
+	  const finalizeSyncResult = (result, timings = buildTimingSummary()) => {
+	    const timingSummary = timings && typeof timings === 'object' ? timings : buildTimingSummary();
+	    if (shouldLogSyncTiming) {
+	      const makerTradeMin = getMakerTradeMinLabel();
+	      console.log('[Polymarket Sync Timing]', {
+	        portfolioId: portfolio?._id ? String(portfolio._id) : null,
+	        strategyId: portfolio?.strategy_id ? String(portfolio.strategy_id) : null,
+	        mode: result?.mode ?? null,
+	        tradeSource: result?.tradeSource ?? null,
         processed: result?.processed ?? null,
         buys: result?.buys ?? null,
         sells: result?.sells ?? null,
         skipped: result?.skipped ?? null,
-        waitingForTrades: result?.waitingForTrades ?? null,
-        pagesFetched: result?.pagesFetched ?? null,
-        totalMs: timingSummary.totalMs,
-        topPhases: Array.isArray(timingSummary.phases) ? timingSummary.phases.slice(0, 5) : [],
-      });
-    }
+	        waitingForTrades: result?.waitingForTrades ?? null,
+	        pagesFetched: result?.pagesFetched ?? null,
+	        totalMs: timingSummary.totalMs,
+	        ...(makerTradeMin ? { makerTradeMin } : {}),
+	        topPhases: Array.isArray(timingSummary.phases) ? timingSummary.phases.slice(0, 5) : [],
+	      });
+	    }
     return {
       ...(result || {}),
       timings: timingSummary,
@@ -5646,23 +5665,14 @@ const syncPolymarketPortfolioInternal = async (portfolio, options = {}) => {
 	      lines.push(`• Size-to-budget: ON${segments.length ? ` (${segments.join(' · ')})` : ''}.`);
 	    }
 
-	    const copiedOrderMinNotional = toNumber(POLYMARKET_LIVE_REBALANCE_MIN_NOTIONAL, null);
 	    const currentScale = toNumber(sizingMeta?.scale, null);
-	    const minimumMakerTrade = copiedOrderMinNotional !== null && currentScale && currentScale > 0
-	      ? copiedOrderMinNotional / currentScale
+	    const minimumMakerTrade = currentScale && currentScale > 0
+	      ? POLYMARKET_LIVE_REBALANCE_MIN_NOTIONAL / currentScale
 	      : null;
-	    if (copiedOrderMinNotional !== null || minimumMakerTrade !== null) {
-	      const segments = [];
-	      const copiedLabel = formatUsd(copiedOrderMinNotional);
-	      if (copiedLabel) {
-	        segments.push(`copied order min ${copiedLabel}`);
-	      }
+	    if (minimumMakerTrade !== null) {
 	      const makerLabel = formatUsd(minimumMakerTrade);
 	      if (makerLabel) {
-	        segments.push(`maker trade min ${makerLabel}`);
-	      }
-	      if (segments.length) {
-	        lines.push(`• Copy threshold: ${segments.join(' · ')}.`);
+	        lines.push(`• Copy threshold: maker trade min ${makerLabel}.`);
 	      }
 	    }
 
