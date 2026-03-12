@@ -27,7 +27,7 @@ const {
   rebalanceNow,
   isRebalanceLocked,
   fetchNextMarketSessionAfter,
-  alignToRebalanceWindowStart,
+  alignToAutomaticRebalanceSlot,
 } = require('../services/rebalanceService');
 const { syncPolymarketPortfolio, isValidHexAddress } = require('../services/polymarketCopyService');
 const {
@@ -3005,7 +3005,9 @@ exports.updateStrategyRecurrence = async (req, res) => {
         const alpacaConfig = await getAlpacaConfig(userId);
         if (alpacaConfig?.hasValidKeys) {
           const tradingKeys = alpacaConfig.getTradingKeys();
-          nextRebalanceAt = await alignToRebalanceWindowStart(tradingKeys, provisionalNext);
+          nextRebalanceAt =
+            (await alignToAutomaticRebalanceSlot(tradingKeys, normalizedRecurrence, provisionalNext))
+            || provisionalNext;
         }
       }
     } catch (error) {
@@ -5314,6 +5316,17 @@ exports.addPortfolio = async (strategyinput, strategyName, orders, UserID, optio
     const clock = await alpacaApi.getClock();
     const now = new Date();
     const portfolioExecutionMode = normalizedExecutionMode || (alpacaConfig.paper ? 'paper' : 'live');
+    let nextRebalanceAt = computeNextRebalanceAt(normalizedRecurrence, now);
+    try {
+      const tradingKeys = alpacaConfig?.getTradingKeys ? alpacaConfig.getTradingKeys() : null;
+      if (tradingKeys) {
+        nextRebalanceAt =
+          (await alignToAutomaticRebalanceSlot(tradingKeys, normalizedRecurrence, nextRebalanceAt))
+          || nextRebalanceAt;
+      }
+    } catch (error) {
+      nextRebalanceAt = computeNextRebalanceAt(normalizedRecurrence, now);
+    }
 
     if (strategyName === 'AI Fund') {
       strategy_id = '01';
@@ -5357,7 +5370,7 @@ exports.addPortfolio = async (strategyinput, strategyName, orders, UserID, optio
         cashBuffer: 0,
         retainedCash: 0,
         lastRebalancedAt: null,
-        nextRebalanceAt: computeNextRebalanceAt(normalizedRecurrence, now),
+        nextRebalanceAt,
         targetPositions: targets,
         alpaca: { executionMode: portfolioExecutionMode },
         budget: toNumber(limitValue, null),
@@ -5429,7 +5442,7 @@ exports.addPortfolio = async (strategyinput, strategyName, orders, UserID, optio
           reasoning,
           orders: plannedOrders,
           recurrence: normalizedRecurrence,
-          nextRebalanceAt: computeNextRebalanceAt(normalizedRecurrence, now),
+          nextRebalanceAt,
           cashLimit: toNumber(limitValue, null),
           initialInvestment: initialInvestmentEstimate,
           status: 'pending',
@@ -5538,7 +5551,7 @@ exports.addPortfolio = async (strategyinput, strategyName, orders, UserID, optio
       cashBuffer,
       retainedCash,
       lastRebalancedAt: now,
-      nextRebalanceAt: computeNextRebalanceAt(normalizedRecurrence, now),
+      nextRebalanceAt,
       targetPositions: targets,
       alpaca: { executionMode: portfolioExecutionMode },
       budget: toNumber(limitValue, null),

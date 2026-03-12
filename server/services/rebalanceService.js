@@ -207,8 +207,29 @@ const ORDER_PENDING_STATUSES = new Set([
 
 const DEFAULT_REBALANCE_WINDOW_MINUTES = (() => {
   const parsed = Number(process.env.REBALANCE_WINDOW_MINUTES);
-  return Number.isFinite(parsed) && parsed > 0 ? parsed : 30;
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : 120;
 })();
+
+const DATE_ANCHORED_REBALANCE_RECURRENCES = new Set(['daily', 'weekly', 'monthly']);
+
+const shouldAnchorRebalanceToTargetSessionDate = (recurrence) =>
+  DATE_ANCHORED_REBALANCE_RECURRENCES.has(normalizeRecurrence(recurrence));
+
+const startOfUtcDay = (date) => {
+  const safeDate = date instanceof Date ? date : new Date(date);
+  if (Number.isNaN(safeDate?.getTime())) {
+    return null;
+  }
+  return new Date(Date.UTC(
+    safeDate.getUTCFullYear(),
+    safeDate.getUTCMonth(),
+    safeDate.getUTCDate(),
+    0,
+    0,
+    0,
+    0
+  ));
+};
 
 const computeRebalanceWindow = (closeTime, windowMinutes = DEFAULT_REBALANCE_WINDOW_MINUTES) => {
   const close = closeTime instanceof Date ? closeTime : new Date(closeTime);
@@ -555,6 +576,20 @@ const alignToRebalanceWindowStart = async (tradingKeys, desiredDate, options = {
     return nextAligned || alignedOpen;
   }
   return desiredDate;
+};
+
+const alignToAutomaticRebalanceSlot = async (tradingKeys, recurrence, desiredDate) => {
+  if (!desiredDate) {
+    return desiredDate;
+  }
+  const normalizedRecurrence = normalizeRecurrence(recurrence);
+  const anchorDate = shouldAnchorRebalanceToTargetSessionDate(normalizedRecurrence)
+    ? startOfUtcDay(desiredDate) || desiredDate
+    : desiredDate;
+  const windowOptions = shouldAnchorRebalanceToTargetSessionDate(normalizedRecurrence)
+    ? { anchor: 'start' }
+    : undefined;
+  return alignToRebalanceWindowStart(tradingKeys, anchorDate, windowOptions);
 };
 
 const buildRebalanceHumanSummary = ({
@@ -1359,12 +1394,16 @@ const rebalancePortfolio = async (portfolio) => {
     const nextOpenValid = nextOpen && !Number.isNaN(nextOpen.getTime());
 
     const openAnchor = nextOpenValid ? nextOpen : await alignToNextMarketOpen(tradingKeys, fallbackNext);
-    let scheduledAt = await alignToRebalanceWindowStart(tradingKeys, openAnchor || fallbackNext);
+    let scheduledAt = await alignToAutomaticRebalanceSlot(tradingKeys, recurrence, openAnchor || fallbackNext);
 
     if (!scheduledAt || scheduledAt <= now) {
       const bufferDate = new Date(now.getTime() + 60000);
       const bufferedNext = computeNextRebalanceAt(recurrence, bufferDate);
-      const alignedBuffered = await alignToRebalanceWindowStart(tradingKeys, bufferedNext);
+      const alignedBuffered = await alignToAutomaticRebalanceSlot(
+        tradingKeys,
+        recurrence,
+        bufferedNext
+      );
       scheduledAt = alignedBuffered > now ? alignedBuffered : bufferedNext;
     }
 
@@ -1385,7 +1424,7 @@ const rebalancePortfolio = async (portfolio) => {
         rescheduledFor: scheduledAt.toISOString(),
         thoughtProcess: {
           ...baseThoughtProcess,
-          reason: 'Market closed at attempted rebalance time; rescheduled to next open window.',
+          reason: 'Market closed at attempted rebalance time; rescheduled to the next eligible pre-close slot.',
         },
         humanSummary: [
           `Rebalance postponed for "${portfolio.name}" because markets were closed.`,
@@ -2119,12 +2158,7 @@ const rebalancePortfolio = async (portfolio) => {
   portfolio.rebalanceCount = (toNumber(portfolio.rebalanceCount, 0) || 0) + 1;
   portfolio.lastRebalancedAt = now;
   const provisionalNext = computeNextRebalanceAt(recurrence, now);
-  const shouldAnchorToWindowStart = recurrence === 'daily' || recurrence === 'weekly' || recurrence === 'monthly';
-  const alignedNext = await alignToRebalanceWindowStart(
-    tradingKeys,
-    provisionalNext,
-    shouldAnchorToWindowStart ? { anchor: 'start' } : undefined
-  );
+  const alignedNext = await alignToAutomaticRebalanceSlot(tradingKeys, recurrence, provisionalNext);
   portfolio.nextRebalanceAt = alignedNext || provisionalNext;
   portfolio.nextRebalanceManual = false;
   portfolio.recurrence = recurrence;
@@ -2413,7 +2447,7 @@ const rebalanceNow = async ({ strategyId, userId, mode = null }) => withRebalanc
   if (!portfolio) {
     throw new Error('Portfolio not found');
   }
-  // Manual "rebalance now" should bypass the default end-of-day window once.
+  // Manual "rebalance now" should bypass the automatic scheduling window once.
   portfolio.nextRebalanceManual = true;
   const provider = String(portfolio.provider || 'alpaca');
   if (provider === 'polymarket') {
@@ -2435,6 +2469,7 @@ module.exports = {
   resetRebalanceLock,
   buildAdjustments,
   fetchNextMarketSessionAfter,
+  alignToAutomaticRebalanceSlot,
   alignToRebalanceWindowStart,
   computeRebalanceWindow,
 };
