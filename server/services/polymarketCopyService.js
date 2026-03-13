@@ -5080,11 +5080,14 @@ const syncPolymarketPortfolioInternal = async (portfolio, options = {}) => {
             break;
           }
         }
-	          if (orderbook && orderbook.ok === true) {
+	        if (orderbook && orderbook.ok === true) {
+            order.tickSize = orderbook.tickSize ?? null;
+            order.negRisk = typeof orderbook.negRisk === 'boolean' ? orderbook.negRisk : null;
+            const allowDirectExecutionWithoutOrderbookMatch = order.negRisk === true;
 	          const noLiquidity =
 	            (order.side === 'BUY' && Number(orderbook.askCount) === 0) ||
 	            (order.side === 'SELL' && Number(orderbook.bidCount) === 0);
-	          if (noLiquidity) {
+	          if (noLiquidity && !allowDirectExecutionWithoutOrderbookMatch) {
 	            const diagnostics = buildRebalanceDiagnostics({ orderbook });
 	            const error =
 	              order.side === 'BUY'
@@ -5110,8 +5113,6 @@ const syncPolymarketPortfolioInternal = async (portfolio, options = {}) => {
 	          }
 
 	            try {
-	              order.tickSize = orderbook.tickSize ?? null;
-	              order.negRisk = typeof orderbook.negRisk === 'boolean' ? orderbook.negRisk : null;
 	              const limitPrice = computeMarketOrderLimitPrice({
 	                orderbook,
 	                side: order.side,
@@ -5121,6 +5122,11 @@ const syncPolymarketPortfolioInternal = async (portfolio, options = {}) => {
 	                order.limitPrice = limitPrice;
 	              }
 	            } catch (priceError) {
+                if (allowDirectExecutionWithoutOrderbookMatch) {
+                  // Neg-risk books can be one-sided or briefly stale. Let the exchange
+                  // be the source of truth instead of dropping the copy target early.
+                  order.limitPrice = order.limitPrice ?? order.price;
+                } else {
 	              const msg = String(priceError?.message || priceError || 'no match');
 	              const diagnostics = buildRebalanceDiagnostics({ orderbook });
                 noteLiquidityBlock({
@@ -5138,6 +5144,7 @@ const syncPolymarketPortfolioInternal = async (portfolio, options = {}) => {
                 retryAfterMs: order.side === 'BUY' ? liquidityState.buyBlockedUntilMs : liquidityState.sellBlockedUntilMs,
               });
               continue;
+                }
             }
 	        }
 	      }
@@ -5174,7 +5181,7 @@ const syncPolymarketPortfolioInternal = async (portfolio, options = {}) => {
 			          tokenID: order.assetId,
 			          side: order.side,
 			          amount,
-                price: order.limitPrice,
+                price: order.limitPrice ?? order.price,
                 tickSize: order.tickSize,
                 negRisk: order.negRisk,
 			        });

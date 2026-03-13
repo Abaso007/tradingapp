@@ -1091,6 +1091,110 @@ jest.mock('../strategyLogger', () => ({
 		    expect(rebalance.some((row) => row.execution?.orderId)).toBe(true);
 		  });
 
+  it('attempts neg-risk buys even when the direct orderbook side is empty', async () => {
+    const executionModulePath = require.resolve('../polymarketExecutionService');
+    jest.doMock(executionModulePath, () => ({
+      getPolymarketExecutionMode: jest.fn(() => 'live'),
+      executePolymarketMarketOrder: jest.fn(async ({ tokenID, side, amount, price, negRisk }) => ({
+        ok: true,
+        mode: 'live',
+        dryRun: false,
+        request: { tokenID, side, amount, price, negRisk },
+        response: { orderID: `order-${side}-${tokenID}` },
+      })),
+    }));
+
+    process.env.POLYMARKET_BACKFILL_LIVE_REBALANCE = 'true';
+    process.env.POLYMARKET_TRADES_SOURCE = 'clob-l2';
+    process.env.POLYMARKET_API_KEY = 'test-key';
+    process.env.POLYMARKET_SECRET = 'dGVzdA==';
+    process.env.POLYMARKET_PASSPHRASE = 'test-passphrase';
+    process.env.POLYMARKET_AUTH_ADDRESS = '0x1111111111111111111111111111111111111111';
+    process.env.POLYMARKET_LIVE_REBALANCE_MIN_NOTIONAL = '0.01';
+    process.env.POLYMARKET_LIVE_REBALANCE_MAX_ORDERS = '10';
+
+    const clob = nock('https://clob.polymarket.com');
+    clob.get('/time').query(true).reply(200, 1700000000).persist();
+    clob
+      .get('/book')
+      .query((query) => String(query?.token_id || '') === 'asset-no')
+      .reply(200, {
+        market: 'cond-no',
+        asset_id: 'asset-no',
+        bids: [{ price: '0.999', size: '1000' }],
+        asks: [],
+        tick_size: '0.001',
+        neg_risk: true,
+      })
+      .persist();
+    clob
+      .get('/data/trades')
+      .query(true)
+      .reply(200, {
+        data: [
+          {
+            id: 'trade-1',
+            asset_id: 'asset-no',
+            market: 'cond-no',
+            outcome: 'No',
+            side: 'BUY',
+            size: 10,
+            price: 0.999,
+            match_time: 1700000001,
+          },
+        ],
+        next_cursor: 'LTE=',
+      });
+    clob.get('/markets/cond-no').query(true).reply(200, {
+      tokens: [{ token_id: 'asset-no', price: 0.999, outcome: 'No' }],
+    }).persist();
+
+    const { syncPolymarketPortfolio } = require('../polymarketCopyService');
+    const { executePolymarketMarketOrder } = require(executionModulePath);
+
+    const portfolio = {
+      provider: 'polymarket',
+      userId: 'user-1',
+      strategy_id: 'strategy-neg-risk',
+      name: 'Polymarket Neg Risk Direct Buy',
+      recurrence: 'every_minute',
+      stocks: [],
+      retainedCash: 100,
+      cashBuffer: 100,
+      budget: 100,
+      cashLimit: 100,
+      initialInvestment: 100,
+      rebalanceCount: 0,
+      save: jest.fn(async () => {}),
+      polymarket: {
+        address: '0x3333333333333333333333333333333333333333',
+        executionMode: 'live',
+        sizeToBudget: true,
+        authAddress: null,
+        backfillPending: true,
+        backfilledAt: null,
+        apiKey: null,
+        secret: null,
+        passphrase: null,
+        lastTradeMatchTime: '1970-01-01T00:00:00.000Z',
+        lastTradeId: null,
+      },
+    };
+
+    await syncPolymarketPortfolio(portfolio, { mode: 'backfill' });
+
+    expect(executePolymarketMarketOrder).toHaveBeenCalledTimes(1);
+    expect(executePolymarketMarketOrder).toHaveBeenCalledWith(
+      expect.objectContaining({
+        tokenID: 'asset-no',
+        side: 'BUY',
+        negRisk: true,
+      })
+    );
+    const [firstCall] = executePolymarketMarketOrder.mock.calls;
+    expect(firstCall?.[0]?.price).toBeCloseTo(0.999, 6);
+  });
+
   it('retries pending live size-to-budget orders even when no new maker trades arrive', async () => {
     const executionModulePath = require.resolve('../polymarketExecutionService');
     jest.doMock(executionModulePath, () => ({
