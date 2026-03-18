@@ -90,6 +90,31 @@ describe('polymarketExecutionService', () => {
       }
     ));
 
+  test('market order clamps a near-1 buy price to the CLOB max tick-aligned price', () =>
+    withEnv(
+      {
+        POLYMARKET_EXECUTION_MODE: 'paper',
+      },
+      async () => {
+        const result = await executePolymarketMarketOrder({
+          tokenID: '123',
+          side: 'BUY',
+          amount: 76.8,
+          price: 0.9995,
+          tickSize: '0.001',
+        });
+        expect(result.ok).toBe(true);
+        expect(result.dryRun).toBe(true);
+        expect(result.request).toMatchObject({
+          tokenID: '123',
+          side: 'BUY',
+          amount: 76.8,
+          price: 0.999,
+          tickSize: '0.001',
+        });
+      }
+    ));
+
   test('serializes clob requests through a single host-level slot by default', async () => {
     const events = [];
     let releaseFirst = null;

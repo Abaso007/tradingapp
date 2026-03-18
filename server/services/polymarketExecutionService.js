@@ -1286,12 +1286,59 @@ const normalizeTickSize = (value) => {
   return allowed.has(normalized) ? normalized : null;
 };
 
+const getTickDecimals = (value) => {
+  const raw = normalizeEnvValue(value);
+  if (!raw.includes('.')) {
+    return 0;
+  }
+  return raw.split('.')[1].length;
+};
+
+const normalizeMarketOrderPrice = ({ price, side, tickSize }) => {
+  if (!Number.isFinite(price)) {
+    return null;
+  }
+
+  const normalizedSide = normalizeEnvValue(side).toUpperCase();
+  const numericTickSize = Number(tickSize);
+  const minPrice = 0.001;
+  const maxPrice = 0.999;
+
+  if (!Number.isFinite(numericTickSize) || numericTickSize <= 0) {
+    return Math.min(maxPrice, Math.max(minPrice, price));
+  }
+
+  const decimals = Math.max(0, Math.min(12, getTickDecimals(tickSize)));
+  const toFixedNumber = (value) => Number(value.toFixed(decimals));
+  const epsilon = Math.max(Number.EPSILON * 10, numericTickSize / 1_000);
+  const minUnits = Math.ceil((minPrice - epsilon) / numericTickSize);
+  const maxUnits = Math.floor((maxPrice + epsilon) / numericTickSize);
+
+  if (maxUnits < minUnits) {
+    return Math.min(maxPrice, Math.max(minPrice, price));
+  }
+
+  const minAllowed = toFixedNumber(minUnits * numericTickSize);
+  const maxAllowed = toFixedNumber(maxUnits * numericTickSize);
+  const rawUnits = price / numericTickSize;
+  let snappedUnits;
+
+  if (normalizedSide === 'SELL') {
+    snappedUnits = Math.ceil(rawUnits - epsilon);
+  } else {
+    snappedUnits = Math.floor(rawUnits + epsilon);
+  }
+
+  const boundedUnits = Math.min(maxUnits, Math.max(minUnits, snappedUnits));
+  return toFixedNumber(boundedUnits * numericTickSize);
+};
+
 const executePolymarketMarketOrder = async ({ tokenID, side, amount, price, tickSize, negRisk }) => {
   const mode = getPolymarketExecutionMode();
   const cleanedToken = normalizeEnvValue(tokenID);
   const cleanedSide = normalizeEnvValue(side).toUpperCase();
   const cleanedAmount = Number(amount);
-  const cleanedPrice = price === undefined || price === null || price === '' ? null : Number(price);
+  const requestedPrice = price === undefined || price === null || price === '' ? null : Number(price);
   const cleanedTickSize = normalizeTickSize(tickSize);
   const cleanedNegRisk = typeof negRisk === 'boolean' ? negRisk : null;
 
@@ -1304,6 +1351,18 @@ const executePolymarketMarketOrder = async ({ tokenID, side, amount, price, tick
   if (!Number.isFinite(cleanedAmount) || cleanedAmount <= 0) {
     throw new Error('amount must be a positive number.');
   }
+  if (requestedPrice !== null && (!Number.isFinite(requestedPrice) || requestedPrice <= 0 || requestedPrice >= 1)) {
+    throw new Error('price must be between 0 and 1.');
+  }
+
+  const cleanedPrice =
+    requestedPrice === null
+      ? null
+      : normalizeMarketOrderPrice({
+          price: requestedPrice,
+          side: cleanedSide,
+          tickSize: cleanedTickSize,
+        });
   if (cleanedPrice !== null && (!Number.isFinite(cleanedPrice) || cleanedPrice <= 0 || cleanedPrice >= 1)) {
     throw new Error('price must be between 0 and 1.');
   }
