@@ -586,6 +586,76 @@ const toNumber = (value, fallback = null) => {
   return Number.isFinite(num) ? num : fallback;
 };
 
+const computeHoldingsMarketValueForDisplay = (stocks = [], fallback = null) => {
+  if (!Array.isArray(stocks) || !stocks.length) {
+    return roundToTwo(toNumber(fallback, null));
+  }
+
+  let total = 0;
+  for (const stock of stocks) {
+    const quantity = toNumber(stock?.quantity, null);
+    const currentPrice = toNumber(stock?.currentPrice, null);
+    if (quantity === null || currentPrice === null) {
+      return roundToTwo(toNumber(fallback, null));
+    }
+    total += quantity * currentPrice;
+  }
+
+  return roundToTwo(total);
+};
+
+const pickPortfolioPerformanceBaseline = ({
+  cashLimit = null,
+  budget = null,
+  initialInvestment = null,
+} = {}) => {
+  const candidates = [cashLimit, budget, initialInvestment];
+  for (const candidate of candidates) {
+    const numeric = toNumber(candidate, null);
+    if (numeric !== null && numeric > 0) {
+      return roundToTwo(numeric);
+    }
+  }
+  return null;
+};
+
+const derivePortfolioPerformanceMetrics = ({
+  holdingsMarketValue = null,
+  retainedCash = null,
+  cashLimit = null,
+  budget = null,
+  initialInvestment = null,
+  requireHoldingsForEquity = false,
+} = {}) => {
+  const normalizedHoldings = roundToTwo(toNumber(holdingsMarketValue, null));
+  const normalizedCash = roundToTwo(toNumber(retainedCash, 0));
+  const performanceBaseline = pickPortfolioPerformanceBaseline({
+    cashLimit,
+    budget,
+    initialInvestment,
+  });
+
+  const equityValue = requireHoldingsForEquity && normalizedHoldings === null
+    ? null
+    : roundToTwo((normalizedHoldings || 0) + (normalizedCash || 0));
+
+  const performanceValue =
+    equityValue !== null && performanceBaseline !== null
+      ? roundToTwo(equityValue - performanceBaseline)
+      : null;
+  const performancePercent =
+    performanceValue !== null && performanceBaseline !== null && performanceBaseline > 0
+      ? roundToTwo((performanceValue / performanceBaseline) * 100)
+      : null;
+
+  return {
+    equityValue,
+    performanceBaseline,
+    performanceValue,
+    performancePercent,
+  };
+};
+
 const normalizeBoolean = (value) => {
   if (value == null) {
     return null;
@@ -4557,26 +4627,26 @@ exports.getPortfolios = async (req, res) => {
           provider === 'polymarket' && portfolio?.polymarket?.sizingState && typeof portfolio.polymarket.sizingState === 'object'
             ? portfolio.polymarket.sizingState
             : {};
-        const liteCurrentValue = (() => {
-          const stored = toNumber(portfolio.currentValue, null);
-          if (stored !== null) {
-            return stored;
-          }
-          const stocks = Array.isArray(portfolio.stocks) ? portfolio.stocks : [];
-          const fallback = stocks.reduce((sum, stock) => {
-            const quantity = toNumber(stock?.quantity, null);
-            const currentPrice = toNumber(stock?.currentPrice, null);
-            if (quantity === null || currentPrice === null) {
-              return sum;
-            }
-            return sum + (quantity * currentPrice);
-          }, 0);
-          return stocks.length ? roundToTwo(fallback) : null;
-        })();
+        const liteCashBuffer = toNumber(portfolio.retainedCash, toNumber(portfolio.cashBuffer, 0));
+        const liteCashLimit = toNumber(portfolio.cashLimit, toNumber(portfolio.budget, null));
+        const liteBudget = toNumber(portfolio.budget, null);
+        const liteCurrentValue = computeHoldingsMarketValueForDisplay(
+          Array.isArray(portfolio.stocks) ? portfolio.stocks : [],
+          portfolio.currentValue
+        );
         const liteInitialInvestment = toNumber(portfolio.initialInvestment, 0);
+        const litePerformance = derivePortfolioPerformanceMetrics({
+          holdingsMarketValue: liteCurrentValue,
+          retainedCash: liteCashBuffer,
+          cashLimit: liteCashLimit,
+          budget: liteBudget,
+          initialInvestment: liteInitialInvestment,
+        });
         const litePnlValue = portfolio.pnlValue !== undefined && portfolio.pnlValue !== null
           ? toNumber(portfolio.pnlValue, null)
-          : (liteCurrentValue !== null ? roundToTwo(liteCurrentValue - liteInitialInvestment) : null);
+          : (litePerformance.equityValue !== null
+            ? roundToTwo(litePerformance.equityValue - liteInitialInvestment)
+            : null);
         const litePnlPercent = portfolio.pnlPercent !== undefined && portfolio.pnlPercent !== null
           ? toNumber(portfolio.pnlPercent, null)
           : (litePnlValue !== null && liteInitialInvestment > 0
@@ -4596,14 +4666,18 @@ exports.getPortfolios = async (req, res) => {
             : 0,
           composerHoldingsUpdatedAt: portfolio.composerHoldingsUpdatedAt || null,
           composerHoldingsSource: portfolio.composerHoldingsSource || null,
-          cashBuffer: toNumber(portfolio.retainedCash, toNumber(portfolio.cashBuffer, 0)),
+          cashBuffer: liteCashBuffer,
           initialInvestment: liteInitialInvestment,
           currentValue: liteCurrentValue,
+          equityValue: litePerformance.equityValue,
+          performanceBaseline: litePerformance.performanceBaseline,
+          performanceValue: litePerformance.performanceValue,
+          performancePercent: litePerformance.performancePercent,
           pnlValue: litePnlValue,
           pnlPercent: litePnlPercent,
           targetPositions: [],
-          budget: toNumber(portfolio.budget, null),
-          cashLimit: toNumber(portfolio.cashLimit, toNumber(portfolio.budget, null)),
+          budget: liteBudget,
+          cashLimit: liteCashLimit,
           rebalanceCount: toNumber(portfolio.rebalanceCount, 0),
           status: (() => {
             const next = portfolio.nextRebalanceAt ? new Date(portfolio.nextRebalanceAt) : null;
@@ -5135,7 +5209,18 @@ exports.getPortfolios = async (req, res) => {
         }
         return toNumber(portfolio.cashBuffer, 0);
       })();
-      const equityBase = hasPendingHoldings ? null : (totalCurrentValue + retainedCash);
+      const currentValue = hasPendingHoldings ? null : roundToTwo(totalCurrentValue);
+      const cashLimit = toNumber(portfolio.cashLimit, toNumber(portfolio.budget, null));
+      const budget = toNumber(portfolio.budget, null);
+      const performance = derivePortfolioPerformanceMetrics({
+        holdingsMarketValue: currentValue,
+        retainedCash,
+        cashLimit,
+        budget,
+        initialInvestment,
+        requireHoldingsForEquity: hasPendingHoldings,
+      });
+      const equityBase = performance.equityValue;
       const computedPnlValue = equityBase !== null ? roundToTwo(equityBase - initialInvestment) : null;
       const computedPnlPercent = equityBase !== null && initialInvestment > 0
         ? roundToTwo((computedPnlValue / initialInvestment) * 100)
@@ -5194,12 +5279,16 @@ exports.getPortfolios = async (req, res) => {
         composerHoldingsSource: portfolio.composerHoldingsSource || null,
         cashBuffer: retainedCash,
         initialInvestment,
-        currentValue: hasPendingHoldings ? null : totalCurrentValue,
+        currentValue,
+        equityValue: performance.equityValue,
+        performanceBaseline: performance.performanceBaseline,
+        performanceValue: performance.performanceValue,
+        performancePercent: performance.performancePercent,
         pnlValue,
         pnlPercent,
         targetPositions: normalizedTargets,
-        budget: toNumber(portfolio.budget, null),
-        cashLimit: toNumber(portfolio.cashLimit, toNumber(portfolio.budget, null)),
+        budget,
+        cashLimit,
         rebalanceCount: toNumber(portfolio.rebalanceCount, 0),
         status: (() => {
           const next = portfolio.nextRebalanceAt ? new Date(portfolio.nextRebalanceAt) : null;

@@ -1214,18 +1214,29 @@ const deleteStrategy = async (strategyId) => {
               ? Number(portfolio.currentValue)
               : (allStocksHaveAvgCost ? totalCurrentTotal : null);
           const cashBufferValue = Number.isFinite(Number(portfolio.cashBuffer)) ? Number(portfolio.cashBuffer) : 0;
-          const equityValue = currentValue !== null ? currentValue + cashBufferValue : null;
+          const equityValue = hasPending
+            ? null
+            : Number.isFinite(Number(portfolio.equityValue))
+              ? Number(portfolio.equityValue)
+              : (currentValue !== null ? currentValue + cashBufferValue : null);
           const initialInvestmentValue = Number.isFinite(Number(portfolio.initialInvestment))
             ? Number(portfolio.initialInvestment)
             : 0;
-          const computedPnlValue = hasPending
+          const performanceBaseline = Number.isFinite(Number(portfolio.performanceBaseline))
+            ? Number(portfolio.performanceBaseline)
+            : (limitBaseline !== null ? limitBaseline : (initialInvestmentValue > 0 ? initialInvestmentValue : null));
+          const performanceValue = hasPending
             ? null
-            : portfolio.pnlValue !== undefined && portfolio.pnlValue !== null && Number.isFinite(Number(portfolio.pnlValue))
-              ? Number(portfolio.pnlValue)
-              : (equityValue !== null ? equityValue - initialInvestmentValue : null);
-          const pnlPercent = portfolio.pnlPercent !== undefined && portfolio.pnlPercent !== null && Number.isFinite(Number(portfolio.pnlPercent))
-            ? Number(portfolio.pnlPercent)
-            : (computedPnlValue !== null && initialInvestmentValue > 0 ? (computedPnlValue / initialInvestmentValue) * 100 : null);
+            : Number.isFinite(Number(portfolio.performanceValue))
+              ? Number(portfolio.performanceValue)
+              : (equityValue !== null && performanceBaseline !== null ? equityValue - performanceBaseline : null);
+          const performancePercent = hasPending
+            ? null
+            : Number.isFinite(Number(portfolio.performancePercent))
+              ? Number(portfolio.performancePercent)
+              : (performanceValue !== null && performanceBaseline !== null && performanceBaseline > 0
+                ? (performanceValue / performanceBaseline) * 100
+                : null);
 
           const limitDifference = limitBaseline !== null && currentValue !== null
             ? currentValue - limitBaseline
@@ -1234,15 +1245,17 @@ const deleteStrategy = async (strategyId) => {
             ? Math.min(100, Math.max(0, (currentValue / limitBaseline) * 100))
             : null;
           const rebalanceCount = Number.isFinite(Number(portfolio.rebalanceCount)) ? Number(portfolio.rebalanceCount) : 0;
-          const pnlValue = computedPnlValue;
-          const pnlDisplay = (() => {
-            if (pnlValue === null || Number.isNaN(pnlValue)) {
+          const showPerformanceBaseline = performanceBaseline !== null && (
+            initialInvestmentValue <= 0 || Math.abs(performanceBaseline - initialInvestmentValue) > 0.009
+          );
+          const performanceDisplay = (() => {
+            if (performanceValue === null || Number.isNaN(performanceValue)) {
               return null;
             }
-            const arrow = pnlValue >= 0 ? '▲' : '▼';
-            const amount = `$${Math.abs(roundNumber(pnlValue)).toLocaleString()}`;
-            const percentText = pnlPercent !== null && !Number.isNaN(pnlPercent)
-              ? ` (${Math.abs(pnlPercent).toFixed(2)}%)`
+            const arrow = performanceValue >= 0 ? '▲' : '▼';
+            const amount = `$${Math.abs(roundNumber(performanceValue)).toLocaleString()}`;
+            const percentText = performancePercent !== null && !Number.isNaN(performancePercent)
+              ? ` (${Math.abs(performancePercent).toFixed(2)}%)`
               : '';
             return `${arrow} ${amount}${percentText}`;
           })();
@@ -1454,13 +1467,17 @@ const deleteStrategy = async (strategyId) => {
               </Box>
               {hasPending ? (
                 <Typography variant="body2" color="textSecondary" sx={{ ml: 6 }}>
-                  Orders pending fill — portfolio value and P/L will update once trades execute.
+                  Orders pending fill — portfolio value and performance will update once trades execute.
                 </Typography>
               ) : (
                 <Typography variant="body2" color="textSecondary" sx={{ ml: 6 }}>
-                  Initial investment: {formatCurrencyValue(initialInvestmentValue)} · Holdings value: {currentValue !== null ? formatCurrencyValue(currentValue) : '—'} · Equity: {equityValue !== null ? formatCurrencyValue(equityValue) : '—'}
-                  {pnlDisplay && (
-                    <> · P/L: <span className={pnlValue >= 0 ? styles.positive : styles.negative}>{pnlDisplay}</span></>
+                  Initial investment: {formatCurrencyValue(initialInvestmentValue)}
+                  {showPerformanceBaseline && (
+                    <> · Performance baseline: {formatCurrencyValue(performanceBaseline)}</>
+                  )}
+                  {' '}· Holdings value: {currentValue !== null ? formatCurrencyValue(currentValue) : '—'} · Equity: {equityValue !== null ? formatCurrencyValue(equityValue) : '—'}
+                  {performanceDisplay && (
+                    <> · Performance: <span className={performanceValue >= 0 ? styles.positive : styles.negative}>{performanceDisplay}</span></>
                   )}
                 </Typography>
               )}
