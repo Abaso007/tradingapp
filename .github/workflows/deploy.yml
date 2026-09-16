@@ -6,6 +6,12 @@ on:
       - master
       - production
 
+permissions:
+  contents: read
+concurrency:
+  group: tradingapp-production
+  cancel-in-progress: false
+
 jobs:
   deploy:
     runs-on: ubuntu-latest
@@ -15,9 +21,15 @@ jobs:
       uses: actions/checkout@v4
 
     - name: Setup Node.js (client build)
-      uses: actions/setup-node@v3
+      uses: actions/setup-node@v4
       with:
         node-version: '22'
+
+    - name: Test server
+      working-directory: server
+      run: |
+        npm ci
+        npm test -- --silent
 
     - name: Build React client
       run: |
@@ -27,7 +39,7 @@ jobs:
         tar -czf ../client-build.tgz build
 
     - name: Copy build to droplet
-      uses: appleboy/scp-action@master
+      uses: appleboy/scp-action@ff85246acaad7bdce478db94a363cd2bf7c90345 # v1.0.0
       with:
         host: ${{ secrets.DO_HOST }}
         username: ${{ secrets.DO_USERNAME }}
@@ -37,13 +49,17 @@ jobs:
         target: /tmp
 
     - name: Deploy to DigitalOcean
-      uses: appleboy/ssh-action@master
+      uses: appleboy/ssh-action@7eaf76671a0d7eec5d98ee897acda4f968735a17 # v1.2.0
       with:
         host: ${{ secrets.DO_HOST }}
         username: ${{ secrets.DO_USERNAME }}
         key: ${{ secrets.DO_SSH_KEY }}
         port: 22
         script: |
+          set -euo pipefail
+          DEPLOY_SCRIPT="$(mktemp /tmp/tradingapp-deploy.XXXXXX)"
+          trap 'rm -f "$DEPLOY_SCRIPT"' EXIT
+          cat > "$DEPLOY_SCRIPT" <<'DEPLOY'
           set -euo pipefail
 
           echo "🚀 Starting deployment..."
@@ -55,7 +71,14 @@ jobs:
           echo "📥 Pulling latest code..."
           BRANCH="${{ github.ref_name }}"
           git fetch origin "$BRANCH"
-          git checkout -B "$BRANCH" "origin/$BRANCH"
+          git checkout -B "$BRANCH" "${{ github.sha }}"
+
+          # Require explicit ownership before starting the hardened runtime.
+          node - <<'NODE'
+          const fs = require('fs');
+          const text = fs.readFileSync('server/config/.env', 'utf8');
+          if (!/^ALPACA_OWNER_USER_ID=.+/m.test(text)) throw new Error('Configure ALPACA_OWNER_USER_ID before deployment');
+          NODE
 
           # Ensure non-secret runtime defaults exist (keeps existing values)
           echo "⚙️ Ensuring .env defaults..."
@@ -66,7 +89,7 @@ jobs:
           # Install server dependencies
           echo "📦 Installing server dependencies..."
           cd server
-          npm install --omit=dev
+          npm ci --omit=dev
 
           # Replace client build with the artifact from GitHub Actions
           echo "📦 Updating React build..."
@@ -84,9 +107,9 @@ jobs:
           pm2 status
 
           # Basic health check
-          echo "🏥 Checking /api/ping..."
+          echo "🏥 Checking MongoDB readiness..."
           for i in $(seq 1 15); do
-            if curl -fsS --max-time 5 "http://127.0.0.1:3000/api/ping" >/dev/null; then
+            if curl -fsS --max-time 5 "http://127.0.0.1:3000/api/ready" >/dev/null; then
               echo "✅ Health check OK"
               break
             fi
@@ -98,3 +121,11 @@ jobs:
           done
 
           echo "✅ Deployment complete!"
+          DEPLOY
+          if [ "$(id -u)" -eq 0 ]; then
+            chown deploy:deploy "$DEPLOY_SCRIPT"
+            sudo -u deploy -H bash "$DEPLOY_SCRIPT"
+          else
+            test "$(id -un)" = deploy
+            bash "$DEPLOY_SCRIPT"
+          fi

@@ -22,9 +22,9 @@ lib-cov
 coverage
 *.lcov
 
-# ignore package-lock files we don't want tracked
-# (client lockfiles are now tracked so `npm ci` works)
-server/package-lock.json
+# Both server and client lockfiles are tracked for reproducible deployments.
+# Private account audit snapshots stay local.
+docs/audits/
 
 
 # nyc test coverage

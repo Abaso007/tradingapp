@@ -21,6 +21,12 @@ const portfolioSchema = new Schema({
     type: String,
     ref: 'Strategy',
   },
+  lifecycle: { type: String, enum: ['active', 'paused', 'closing', 'closed'], default: 'active', index: true },
+  closureRequestedAt: { type: Date, default: null },
+  executionState: { type: String, default: 'idle' },
+  executionAttempts: { type: Number, default: 0 },
+  executionJournal: { type: Schema.Types.Mixed, default: null },
+  accounting: { type: Schema.Types.Mixed, default: null },
   recurrence: {
     type: String,
     enum: [

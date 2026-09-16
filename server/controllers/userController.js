@@ -11,7 +11,7 @@ exports.getUser = async (req, res) => {
     }
   })();
   const hasUserPaperKeys = Boolean(user?.ALPACA_API_KEY_ID && user?.ALPACA_API_SECRET_KEY);
-  const hasEnvPaperKeys = Boolean(process.env.ALPACA_API_KEY_ID && process.env.ALPACA_API_SECRET_KEY);
+  const hasEnvPaperKeys = String(req.user) === process.env.ALPACA_OWNER_USER_ID && Boolean(process.env.ALPACA_API_KEY_ID && process.env.ALPACA_API_SECRET_KEY);
   const alpacaKeysPresent = hasUserPaperKeys || hasEnvPaperKeys;
 
   res.status(200).json({

@@ -134,7 +134,7 @@ mongoose.connection.on('disconnecting', () => logConnectionState('Event: disconn
 
 const app = express();
 const port = process.env.PORT || 3000;
-const bindHost = String(process.env.BIND_HOST || '').trim() || '0.0.0.0';
+const bindHost = String(process.env.BIND_HOST || '').trim() || '127.0.0.1';
 const resolveTrustProxySetting = (value) => {
   const raw = String(value ?? '1').trim();
   const normalized = raw.toLowerCase();
@@ -855,6 +855,11 @@ app.get("/api/ping", (req, res) => {
     status: "ok",
     timestamp: Date.now(),
   });
+});
+
+app.get('/api/ready', (req, res) => {
+  const ready = mongoose.connection.readyState === 1 && missingCriticalVars.length === 0;
+  res.status(ready ? 200 : 503).json({ status: ready ? 'ready' : 'unavailable' });
 });
 
 // Start HTTP server immediately (Render expects your process to bind to $PORT quickly).

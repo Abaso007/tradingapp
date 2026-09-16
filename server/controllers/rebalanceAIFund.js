@@ -100,7 +100,7 @@
                 let totalScore = topAssets.reduce((total, asset) => total + asset.Score, 0);
                 let budget = portfolio.budget;
           
-                const alpacaConfig = await getAlpacaConfig(UserID);
+                const alpacaConfig = await getAlpacaConfig(UserID, 'paper');
                 console.log("config key done");
           
                 for (let i = 0; i < orderList.length; i++) {

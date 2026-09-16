@@ -3,6 +3,7 @@ const { setAlpaca } = require('./alpaca');
 const CACHE_TTL_MS = Number(process.env.ALPACA_CONFIG_CACHE_MS || 5 * 60 * 1000);
 const configCache = new Map();
 const pendingRequests = new Map();
+let generation = 0;
 
 const buildCacheKey = (userId, forceMode) =>
   `${userId || 'default'}::${forceMode || 'auto'}`;
@@ -24,12 +25,13 @@ const getAlpacaConfig = async (userId, forceMode = null) => {
     return pendingRequests.get(cacheKey);
   }
 
+  const requestGeneration = generation;
   const fetchPromise = (async () => {
     const config = await setAlpaca(userId, forceMode);
     if (!config.hasValidKeys) {
       throw new Error(config.error || 'No valid API keys found');
     }
-    configCache.set(cacheKey, { timestamp: now, config });
+    if (generation === requestGeneration) configCache.set(cacheKey, { timestamp: now, config });
     return config;
   })()
     .catch((error) => {
@@ -45,11 +47,13 @@ const getAlpacaConfig = async (userId, forceMode = null) => {
 };
 
 const clearAlpacaConfigCache = (userId = null, forceMode = null) => {
-  if (userId === null && forceMode === null) {
-    configCache.clear();
-    return;
+  generation += 1;
+  pendingRequests.clear();
+  for (const key of configCache.keys()) {
+    if (userId === null || (key.startsWith(`${userId}::`) && (!forceMode || key === buildCacheKey(userId, forceMode)))) {
+      configCache.delete(key);
+    }
   }
-  configCache.delete(buildCacheKey(userId, forceMode));
 };
 
 module.exports = {

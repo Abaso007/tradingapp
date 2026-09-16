@@ -1,4 +1,4 @@
-const CryptoJS = require('crypto-js');
+const { decryptIfEncrypted: decryptKey } = require('../utils/secretUtils');
 const User = require("../models/userModel");
 const Axios = require('axios');
 
@@ -65,76 +65,26 @@ const createAlpacaClient = (config) => {
   return client;
 };
 
-// Helper function to decrypt API keys
-const decryptKey = (encryptedKey) => {
-  if (!encryptedKey) return null;
-  
-  // If the key starts with 'U2Fsd', it's encrypted
-  if (encryptedKey.startsWith('U2Fsd')) {
-    if (!process.env.ENCRYPTION_KEY) {
-      console.error('[Decryption Error] ENCRYPTION_KEY is not set in environment variables');
-      return null;
-    }
-    try {
-      const bytes = CryptoJS.AES.decrypt(encryptedKey, process.env.ENCRYPTION_KEY);
-      return bytes.toString(CryptoJS.enc.Utf8);
-    } catch (error) {
-      console.error('[Decryption Error] Failed to decrypt key:', error.message);
-      return null;
-    }
-  }
-  
-  // If the key doesn't start with 'U2Fsd', assume it's already decrypted
-  return encryptedKey;
-};
-
 // Main function to set up Alpaca configuration
 const setAlpaca = async (userId, forceMode = null) => {
   try {
-    // Get keys from environment variables first
-    let paperKeyId = process.env.ALPACA_API_KEY_ID;
-    let paperSecretKey = process.env.ALPACA_API_SECRET_KEY;
-    let liveKeyId = process.env.ALPACA_LIVE_API_KEY_ID;
-    let liveSecretKey = process.env.ALPACA_LIVE_API_SECRET_KEY;
-
-    if (ENABLE_ALPACA_CONFIG_DEBUG) {
-      console.log('[Alpaca Config] Environment key presence:', {
-        paperKeyId: Boolean(paperKeyId),
-        paperSecretKey: Boolean(paperSecretKey),
-        liveKeyId: Boolean(liveKeyId),
-        liveSecretKey: Boolean(liveSecretKey),
-      });
-    }
-
-    // If userId is provided, try to get keys from user document
-    if (userId) {
-      const user = await User.findById(userId);
-      if (user) {
-        if (ENABLE_ALPACA_CONFIG_DEBUG) {
-          console.log('[Alpaca Config] User document found; checking for API keys.');
-        }
-        // Only use user document keys if environment variables are not set
-        paperKeyId = paperKeyId || user.ALPACA_API_KEY_ID;
-        paperSecretKey = paperSecretKey || user.ALPACA_API_SECRET_KEY;
-        liveKeyId = liveKeyId || user.ALPACA_LIVE_API_KEY_ID;
-        liveSecretKey = liveSecretKey || user.ALPACA_LIVE_API_SECRET_KEY;
-
-        if (ENABLE_ALPACA_CONFIG_DEBUG) {
-          console.log('[Alpaca Config] Key presence after user lookup:', {
-            paperKeyId: Boolean(paperKeyId),
-            paperSecretKey: Boolean(paperSecretKey),
-            liveKeyId: Boolean(liveKeyId),
-            liveSecretKey: Boolean(liveSecretKey),
-          });
-        }
+    // A complete user-owned pair takes precedence. Never combine credentials
+    // from different accounts, or lend the server account to another user.
+    const owner = String(process.env.ALPACA_OWNER_USER_ID || '').trim();
+    const user = userId ? await User.findById(userId) : null;
+    if (userId && !user) throw new Error('Alpaca account owner not found');
+    const mayUseServerKeys = !userId || (owner && String(userId) === owner);
+    const pair = (idField, secretField) => {
+      if (user?.[idField] || user?.[secretField]) {
+        if (!user[idField] || !user[secretField]) throw new Error('Incomplete user Alpaca key pair');
+        return [decryptKey(user[idField]), decryptKey(user[secretField])];
       }
-    }
-
-    // Try to decrypt keys if they appear to be encrypted
-    paperKeyId = decryptKey(paperKeyId);
-    paperSecretKey = decryptKey(paperSecretKey);
-    liveKeyId = decryptKey(liveKeyId);
-    liveSecretKey = decryptKey(liveSecretKey);
+      return mayUseServerKeys
+        ? [decryptKey(process.env[idField]), decryptKey(process.env[secretField])]
+        : [null, null];
+    };
+    const [paperKeyId, paperSecretKey] = pair('ALPACA_API_KEY_ID', 'ALPACA_API_SECRET_KEY');
+    const [liveKeyId, liveSecretKey] = pair('ALPACA_LIVE_API_KEY_ID', 'ALPACA_LIVE_API_SECRET_KEY');
 
     // Define API URLs
     const paperApiUrl = "https://paper-api.alpaca.markets";

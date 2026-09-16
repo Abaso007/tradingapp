@@ -1,0 +1,52 @@
+const { beginJournal, executeOrder, recoverJournal } = require('../alpacaOrderJournal');
+const keys = (client) => ({ apiUrl: 'https://broker.test', keyId: 'test', secretKey: 'test', client });
+const owned = async () => {};
+const portfolio = () => ({ stocks: [], retainedCash: 100, realizedPnlValue: 0, save: jest.fn(async () => {}), markModified: jest.fn() });
+const payload = { symbol: 'SOXL', side: 'buy', qty: '1', type: 'market', time_in_force: 'day' };
+it('does not turn an accepted zero-fill order into a holding or expense', async () => {
+  const p = portfolio();
+  const client = { post: jest.fn(async (_u, body) => ({ data: { id: 'uuid', client_order_id: body.client_order_id, status: 'accepted', filled_qty: '0' } })) };
+  await beginJournal(p, owned);
+  const result = await executeOrder(p, keys(client), payload, owned, { attempts: 0 });
+  expect(result.terminal).toBe(false);
+  expect(p.stocks).toEqual([]);
+  expect(p.retainedCash).toBe(100);
+  expect(p.save.mock.invocationCallOrder[1]).toBeLessThan(client.post.mock.invocationCallOrder[0]);
+});
+it('recovers a timeout by client id then UUID and applies cumulative fills only once', async () => {
+  const p = portfolio();
+  const client = { post: jest.fn(async () => { throw new Error('timeout'); }), get: jest.fn(async () => ({ data: { id: 'uuid', status: 'partially_filled', filled_qty: '.4', filled_avg_price: '90' } })) };
+  await beginJournal(p, owned);
+  await executeOrder(p, keys(client), payload, owned, { attempts: 0 });
+  expect(await recoverJournal(p, keys(client), owned)).toBe(false);
+  expect(client.get.mock.calls[0][0]).toContain('/orders:by_client_order_id');
+  expect(p.retainedCash).toBe(64);
+  await recoverJournal(p, keys(client), owned);
+  expect(client.get.mock.calls[1][0]).toContain('/orders/uuid');
+  expect(p.stocks[0].quantity).toBe(.4);
+  client.get.mockResolvedValue({ data: { id: 'uuid', status: 'filled', filled_qty: '1', filled_avg_price: '91' } });
+  expect(await recoverJournal(p, keys(client), owned)).toBe(true);
+  expect(p.stocks[0].quantity).toBe(1);
+  expect(p.retainedCash).toBe(9);
+  expect(client.post).toHaveBeenCalledTimes(1);
+});
+it('keeps confirmed partial fills on cancellation at the actual price', async () => {
+  const p = portfolio();
+  await beginJournal(p, owned);
+  const result = await executeOrder(p, keys({ post: async () => ({ data: { id: 'uuid', status: 'canceled', filled_qty: '.2', filled_avg_price: '93' } }) }), payload, owned);
+  expect(result.terminal).toBe(true);
+  expect(p.retainedCash).toBeCloseTo(81.4);
+});
+it('never reposts unresolved 404s and never submits if persisting the intent fails', async () => {
+  const p = portfolio();
+  const client = { post: jest.fn(async () => { throw new Error('timeout'); }), get: jest.fn(async () => { throw { response: { status: 404 } }; }) };
+  await beginJournal(p, owned);
+  await executeOrder(p, keys(client), payload, owned, { attempts: 0 });
+  expect(await recoverJournal(p, keys(client), owned)).toBe(false);
+  expect(await recoverJournal(p, keys(client), owned)).toBe(false);
+  const other = portfolio();
+  await beginJournal(other, owned);
+  other.save.mockRejectedValue(new Error('database offline'));
+  await expect(executeOrder(other, keys(client), payload, owned)).rejects.toThrow('database offline');
+  expect(client.post).toHaveBeenCalledTimes(1);
+});
