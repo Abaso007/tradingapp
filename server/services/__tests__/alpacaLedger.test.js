@@ -27,3 +27,11 @@ it('does not accept an incomplete or repeating activity pagination', async () =>
   const keys = { apiUrl: 'test', client: { get: jest.fn(async () => ({ data: rows })) } };
   await expect(collectActivities(keys, '2026-02-01')).rejects.toThrow('pagination did not advance');
 });
+
+it('records unallocated funding without treating it as profit or strategy capital', () => {
+  const r = reconcileActivities({ universe: ['SOXL'], positions: [], activities: [
+    { id: 'deposit', activity_type: 'CSD', net_amount: '100.79', date: '2026-02-11' },
+  ] });
+  expect(r.netPnl).toBe(0);
+  expect(r.ledger[0]).toMatchObject({ type: 'cash_flow', amount: 100.79, allocated: false });
+});

@@ -48,6 +48,12 @@ const reconcileActivities = ({ activities, positions, universe, includeAccountFe
       const funding = /funding|conversion/i.test(row.description || '');
       if (funding) fundingFees += amount; else tradingFees += amount;
       ledger.push({ id: row.id, type: funding ? 'funding_fee' : 'trading_fee', amount, at: row.date });
+    } else if (['CSD', 'CSW', 'ACATC', 'ACATS'].includes(row.activity_type)) {
+      const amount = Number(row.net_amount);
+      if (!Number.isFinite(amount)) throw new Error('Malformed funding activity');
+      // Account deposits/withdrawals are evidence, not an automatic allocation
+      // to this strategy on a shared account. They do not alter monetary P&L.
+      ledger.push({ id: row.id, type: 'cash_flow', amount, at: row.date, allocated: false });
     } else if (allowed.has(row.symbol) && !['FILL', 'DIV', 'DIVNRA'].includes(row.activity_type)) {
       throw new Error(`Corporate action ${row.activity_type} requires explicit reconciliation`);
     }
