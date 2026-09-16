@@ -36,7 +36,7 @@ const {
 router.route("/collaborative/").post(auth, createCollaborative);
 router.route("/portfolios/:userId").get(auth, getPortfolios);
 router.route("/delete/:userId/:strategyId").delete(auth, deleteCollaborative);
-router.route("/resend/:userId/:strategyId").post(auth, resendCollaborativeOrders);
+router.route("/resend/:userId/:strategyId").post(auth, rebalanceNow);
 router.route("/news/:userId").post(auth, getNewsHeadlines);
 router.route("/score/:userId").get(auth, getScoreHeadlines);
 router.route("/aifund/").post(auth, createCollaborative);
@@ -62,4 +62,5 @@ router.route("/composer-holdings/:userId/:strategyId").get(auth, getComposerHold
 router.route("/diagnose/:userId/:strategyId").get(auth, diagnoseAllocationMismatch);
 router.route("/rebalance-now/:userId/:strategyId").post(auth, rebalanceNow);
 router.route("/progress/:jobId").get(streamStrategyProgress);
+router.route('/lifecycle/:userId/:strategyId').patch(auth, require('../controllers/portfolioLifecycleController').updateLifecycle);
 module.exports = router;

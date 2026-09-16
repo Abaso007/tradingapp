@@ -173,4 +173,22 @@ describe('getPortfolios', () => {
     expect(portfolio.pnlPercent).toBeCloseTo(-185.75, 2);
     expect(portfolio.performanceValue).not.toBeCloseTo(portfolio.pnlValue, 2);
   });
+  it('displays reconciled dollar P&L and lifecycle without inventing a percentage', async () => {
+    const userId = '507f1f77bcf86cd799439011';
+    Object.defineProperty(mongoose.connection, 'db', { configurable: true, writable: true, value: {
+      collection: (name) => name === 'users'
+        ? { findOne: async () => ({ _id: userId }) }
+        : { find: () => ({ toArray: async () => [{ provider: 'alpaca', strategy_id: 'live',
+          initialInvestment: 111.3, budget: 100, cashLimit: 100, retainedCash: .01, currentValue: 103.8,
+          stocks: [{ quantity: 1, currentPrice: 103.8 }], pnlValue: 2.88, pnlPercent: null,
+          accounting: { reconciledAt: '2026-09-16', capitalVerified: false }, lifecycle: 'paused', executionState: 'failed' }] }) },
+    } });
+    const res = mockRes();
+    await getPortfolios({ params: { userId }, user: userId, query: { lite: '1' } }, res);
+    expect(res.body.portfolios[0].performanceValue).toBe(2.88);
+    expect(res.body.portfolios[0].performancePercent).toBeNull();
+    expect(res.body.portfolios[0].pnlPercent).toBeNull();
+    expect(res.body.portfolios[0].status).toBe('paused');
+  });
+
 });

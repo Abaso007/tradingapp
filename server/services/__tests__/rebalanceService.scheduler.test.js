@@ -80,7 +80,7 @@ describe('runDueRebalances scheduler concurrency', () => {
       { _id: 'portfolio-3', provider: 'polymarket', strategy_id: 'strategy-3', userId: 'user-1', name: 'Three' },
     ]);
 
-    const runPromise = runDueRebalances();
+    const runPromise = runDueRebalances('polymarket');
     await new Promise((resolve) => setImmediate(resolve));
 
     expect(syncPolymarketPortfolio).toHaveBeenCalledTimes(2);
@@ -99,4 +99,19 @@ describe('runDueRebalances scheduler concurrency', () => {
     expect(result.due).toBe(3);
     expect(result.concurrency).toBe(2);
   });
+});
+
+it('keeps the Alpaca provider queue available during a long Polymarket sync', async () => {
+  resetRebalanceLock();
+  let release;
+  syncPolymarketPortfolio.mockImplementation(() => new Promise((resolve) => { release = resolve; }));
+  Portfolio.find.mockImplementation((query) => query.provider === 'polymarket'
+    ? [{ _id: 'long', provider: 'polymarket', strategy_id: 'long', userId: 'u' }] : []);
+  const slow = runDueRebalances('polymarket');
+  await new Promise((resolve) => setImmediate(resolve));
+  const fast = await runDueRebalances('alpaca');
+  expect(fast.skipped).not.toBe(true);
+  expect(fast.due).toBe(0);
+  release({ ok: true });
+  await slow;
 });

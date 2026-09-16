@@ -1,7 +1,6 @@
 const User = require("../models/userModel");
 const Stock = require("../models/stockModel");
 const { getAlpacaConfig } = require('../config/alpacaConfig');
-const Alpaca = require('@alpacahq/alpaca-trade-api');
 const Axios = require("axios");
 
 
@@ -306,6 +305,8 @@ exports.editAccount = async (req, res) => {
       },
       { new: true }
     );
+
+    require('../config/alpacaConfig').clearAlpacaConfigCache(req.user);
 
     return res.status(200).json({
       status: "success",

@@ -8,7 +8,7 @@ const StrategyEquitySnapshot = require('../models/strategyEquitySnapshotModel');
 const MaintenanceTask = require('../models/maintenanceTaskModel');
 const News = require("../models/newsModel");
 const { getAlpacaConfig } = require("../config/alpacaConfig");
-const Alpaca = require('@alpacahq/alpaca-trade-api');
+const Alpaca = require('../utils/alpacaClient');
 const axios = require("axios");
 const moment = require('moment');
 const crypto = require('crypto');
@@ -1429,136 +1429,22 @@ exports.createCollaborative = async (req, res) => {
     }));
     const executedTargets = normalizeTargetPositions(executedTargetsRaw);
 
-    publishProgress(jobId, {
-      step: 'placing_orders',
-      status: 'in_progress',
-      message: 'Submitting orders to Alpaca.',
-    });
-
-    const orderFailures = [];
-    const orderPromises = finalizedPlan.map(({ symbol, qty }) => {
-      return retry(() => {
-        const normalized = ENABLE_FRACTIONAL_ORDERS ? normalizeQtyForOrder(qty) : { qty: Math.floor(toNumber(qty, 0)), isFractional: false };
-        if (!normalized.qty) {
-          return Promise.resolve(null);
-        }
-        const qtyValue = normalized.isFractional
-          ? normalized.qty.toFixed(FRACTIONAL_QTY_DECIMALS)
-          : normalized.qty;
-        const timeInForce = normalized.isFractional ? 'day' : 'gtc';
-
-        const submit = (payloadQty, tif) =>
-          axios({
-            method: 'post',
-            url: alpacaConfig.apiURL + '/v2/orders',
-            headers: {
-              'APCA-API-KEY-ID': alpacaConfig.keyId,
-              'APCA-API-SECRET-KEY': alpacaConfig.secretKey
-            },
-            data: {
-              symbol,
-              qty: payloadQty,
-              side: 'buy',
-              type: 'market',
-              time_in_force: tif
-            }
-          });
-
-        return submit(qtyValue, timeInForce)
-          .then((response) => {
-            console.log(`Order of ${qtyValue} shares for ${symbol} has been placed. Order ID: ${response.data.client_order_id}`);
-            return { qty: normalized.qty, symbol, orderID: response.data.client_order_id };
-          })
-          .catch((error) => {
-            if (normalized.isFractional && shouldFallbackToWholeShares(error)) {
-              const fallbackQty = Math.floor(toNumber(qty, 0));
-              if (fallbackQty > 0) {
-                return submit(fallbackQty, 'gtc').then((response) => {
-                  console.log(`Order of ${fallbackQty} shares for ${symbol} has been placed (fallback). Order ID: ${response.data.client_order_id}`);
-                  return { qty: fallbackQty, symbol, orderID: response.data.client_order_id };
-                });
-              }
-            }
-            return Promise.reject(error);
-          });
-      }, 5, 2000).catch((error) => {
-        const status = error?.response?.status;
-        const responseData = error?.response?.data;
-        const headers = error?.response?.headers || {};
-        const requestId =
-          headers['apca-request-id']
-          || headers['x-request-id']
-          || headers['x-request-id'.toLowerCase()]
-          || 'n/a';
-        const sanitizedBody = (() => {
-          if (!responseData) {
-            return 'No response body';
-          }
-          if (typeof responseData === 'object') {
-            return JSON.stringify(responseData);
-          }
-          return String(responseData);
-        })();
-        console.error(
-          `[OrderError] Failed to place order for ${symbol}. status=${status || 'unknown'} requestId=${requestId} body=${sanitizedBody}`
-        );
-        if (error?.message) {
-          console.error(`[OrderError] Axios message for ${symbol}: ${error.message}`);
-        }
-        orderFailures.push({
-          symbol,
-          status: status ?? null,
-          requestId,
-          message:
-            (typeof responseData === 'object' && responseData && responseData.message)
-              ? String(responseData.message)
-              : (error?.message ? String(error.message) : 'Unknown order error'),
-          body: responseData && typeof responseData === 'object' ? responseData : sanitizedBody,
-        });
-        return null;
-      });
-    });
-
-    const orders = (await Promise.all(orderPromises)).filter(Boolean);
-    const initialInvestmentEstimate = plannedCost;
-    if (!orders.length) {
-      console.error('Failed to place all orders.');
-      const first = orderFailures[0];
-      const suffix = orderFailures.length > 1 ? ` (+${orderFailures.length - 1} more)` : '';
-      const detail = first?.message ? ` First error: ${first.message}${suffix}.` : '';
-      return progressFail(
-        400,
-        `Failed to place orders.${detail}`,
-        'placing_orders',
-        orderFailures.length ? { orderFailures } : null
-      );
-    }
-
-    publishProgress(jobId, {
-      step: 'placing_orders',
-      status: 'completed',
-      message: 'Orders submitted to Alpaca.',
-    });
-    const portfolioRecord = await exports.addPortfolio(
-      strategy,
-      strategyName,
-      orders,
-      UserID,
-      {
-        executionMode: requestedExecutionMode,
-        budget: cashLimitInput,
-        cashLimit: cashLimitInput,
-        targetPositions: executedTargets,
-        recurrence,
-        initialInvestment: initialInvestmentEstimate,
-        summary: workingSummary,
-        decisions: workingDecisions,
-        reasoning: composerReasoning,
-        orderPlan: finalizedPlan,
-        composerMeta,
-        symphonyUrl,
-      }
-    );
+    // Persist the strategy and its unspent allocation before the scheduler can
+    // submit anything. Initial buys use the same journal as later rebalances.
+    const strategyId = crypto.randomBytes(16).toString('hex');
+    const executionMode = requestedExecutionMode || (alpacaConfig.paper ? 'paper' : 'live');
+    const definition = new Strategy({ userId: userKey, name: strategyName, strategy, strategy_id: strategyId,
+      recurrence, summary: workingSummary, decisions: workingDecisions, symphonyUrl });
+    await definition.save();
+    const portfolioRecord = new Portfolio({ userId: userKey, name: strategyName, strategy_id: strategyId,
+      provider: 'alpaca', lifecycle: 'active', recurrence, alpaca: { executionMode },
+      budget: cashLimitInput, cashLimit: cashLimitInput, initialInvestment: cashLimitInput,
+      retainedCash: cashLimitInput, cashBuffer: cashLimitInput, stocks: [], targetPositions: executedTargets,
+      nextRebalanceAt: new Date(), nextRebalanceManual: true, executionState: 'queued' });
+    try { await portfolioRecord.save(); }
+    catch (error) { await Strategy.deleteOne({ _id: definition._id }); throw error; }
+    const orders = [];
+    publishProgress(jobId, { step: 'placing_orders', status: 'completed', message: 'Strategy saved; confirmed execution is queued.' });
 
     const schedule = portfolioRecord
       ? {
@@ -1667,150 +1553,38 @@ exports.createCollaborative = async (req, res) => {
 
       const provider = String(portfolio.provider || 'alpaca');
   
-      // Delete the strategy
-      await Strategy.deleteOne({
-        strategy_id: strategyId,
-        $or: [
-          { userId: userKey },
-          { userId: { $exists: false } },
-          { userId: null },
-          { userId: '' },
-        ],
-      })
-      .catch(error => {
-        console.error(`Error deleting strategy: ${error}`);
-        return res.status(500).json({
-          status: "fail",
-          message: "An error occurred while deleting the strategy",
-        });
-      });
-  
-      // Delete the portfolio
-      await Portfolio.deleteOne({ strategy_id: strategyId, userId: userKey })
-      .catch(error => {
-        console.error(`Error deleting portfolio: ${error}`);
-        return res.status(500).json({
-          status: "fail",
-          message: "An error occurred while deleting the portfolio",
-        });
-      });
-
       if (provider === 'polymarket') {
-        await recordStrategyLog({
-          strategyId,
-          userId: userKey,
-          strategyName: strategy.name,
-          message: 'Polymarket strategy deleted',
-          details: {
-            provider,
-            liquidationAttempted: false,
-            humanSummary: [
-              `Polymarket strategy \"${strategy.name}\" deleted.`,
-              '• This strategy is paper-only; no live Polymarket orders were sent.',
-            ].join('\n'),
-          },
-        });
-        return res.status(200).json({
-          status: 'success',
-          message: 'Strategy deleted.',
-          sellOrders: [],
+        if (portfolio.stocks.some((stock) => Number(stock.quantity) > 0)) {
+          return res.status(409).json({ status: 'fail', message: 'Close the Polymarket positions before archiving this strategy.' });
+        }
+        portfolio.lifecycle = 'closed';
+        portfolio.nextRebalanceAt = null;
+        await portfolio.save();
+      } else if (portfolio.lifecycle !== 'closed') {
+        const config = await getAlpacaConfig(userKey, portfolio.alpaca?.executionMode);
+        await require('../services/brokerAccountLock').withBrokerAccountLock(config.getTradingKeys(), async (assertOwned) => {
+          await assertOwned();
+          const updated = await Portfolio.findOneAndUpdate({ _id: portfolio._id, userId: userKey, lifecycle: { $ne: 'closed' } }, {
+            $set: { lifecycle: 'closing', closureRequestedAt: new Date(), executionAttempts: 0,
+              nextRebalanceAt: new Date(), nextRebalanceManual: true },
+          }, { new: true });
+          if (!updated) throw new Error('Portfolio changed while requesting closure');
+          portfolio.lifecycle = updated.lifecycle;
         });
       }
-  
-      const alpacaConfig = await getAlpacaConfig(UserID);
-      const alpacaApi = new Alpaca(alpacaConfig);
-      const clock = await alpacaApi.getClock().catch((error) => {
-        console.error('Failed to retrieve market clock for deletion:', error.message);
-        return null;
+      await recordStrategyLog({ strategyId, userId: userKey, strategyName: strategy.name,
+        message: portfolio.lifecycle === 'closed' ? 'Strategy archived' : 'Strategy closure requested',
+        details: { provider, lifecycle: portfolio.lifecycle, executionMode: portfolio.alpaca?.executionMode } });
+      return res.status(portfolio.lifecycle === 'closed' ? 200 : 202).json({
+        status: 'success', lifecycle: portfolio.lifecycle,
+        message: portfolio.lifecycle === 'closed' ? 'Strategy archived.' : 'Closure queued. Positions and history remain tracked until liquidation is confirmed.',
       });
 
-      const marketOpen = clock?.is_open === true;
-
-      if (!marketOpen) {
-        console.log('[Delete Strategy] Market closed, skipping liquidation orders.');
-        await recordStrategyLog({
-          strategyId,
-          userId: userKey,
-          strategyName: strategy.name,
-          message: 'Strategy deleted while market closed',
-          details: {
-            liquidationAttempted: false,
-            humanSummary: [
-              `Strategy "${strategy.name}" deleted while markets were closed.`,
-              '• No liquidation orders were sent; positions remain until the next trading session.',
-            ].join('\n'),
-          },
-        });
-        return res.status(200).json({
-          status: "success",
-          message: "Strategy deleted. Market was closed, so no liquidation orders were placed.",
-          sellOrders: [],
-        });
-      }
-
-      let sellOrderPromises = portfolio.stocks.map((stock) => {
-        const rawQty = toNumber(stock.quantity, 0);
-        const normalized = ENABLE_FRACTIONAL_ORDERS
-          ? normalizeQtyForOrder(rawQty)
-          : { qty: Math.floor(rawQty), isFractional: false };
-        if (!normalized.qty) {
-          return Promise.resolve(null);
-        }
-        const order = {
-          symbol: stock.symbol,
-          qty: normalized.isFractional ? normalized.qty.toFixed(FRACTIONAL_QTY_DECIMALS) : normalized.qty,
-          side: 'sell',
-          type: 'market',
-          time_in_force: normalized.isFractional ? 'day' : 'gtc',
-        };
-        return alpacaApi.createOrder(order)
-          .then((response) => {
-            console.log(`Sell order of ${order.qty} shares for ${stock.symbol} has been placed. Order ID: ${response.client_order_id}`);
-            return { qty: normalized.qty, symbol: stock.symbol, orderID: response.client_order_id };
-          }).catch((error) => {
-            console.error(`Failed to place sell order for ${stock.symbol}: ${error}`);
-            return null;
-          });
-      });
-  
-      Promise.all(sellOrderPromises).then(sellOrders => {
-        // Filter out any null values
-        sellOrders = sellOrders.filter(order => order !== null);
-  
-        // If all sell orders failed, return an error message
-        if (sellOrders.length === 0) {
-          console.error('Failed to place all sell orders.');
-          return res.status(400).json({
-            status: "fail",
-            message: "Failed to place sell orders. Try again.",
-          });
-        }
-  
-        // If some sell orders were successful, return a success message
-        return res.status(200).json({
-          status: "success",
-          message: "Strategy and portfolio deleted successfully, and sell orders placed.",
-          sellOrders: sellOrders,
-        });
-
-
-
-
-
-        
-      }).catch(error => {
-        console.error(`Error: ${error}`);
-        return res.status(400).json({
-          status: "fail",
-          message: `Something unexpected happened: ${error.message}`,
-        });
-      });
-  
     } catch (error) {
       console.error(`Error deleting strategy and portfolio: ${error}`);
-      return res.status(500).json({
+      return res.status(409).json({
         status: "fail",
-        message: "An error occurred while deleting the strategy and portfolio",
+        message: error.message || "Unable to request strategy closure",
       });
     }
   };
@@ -1868,6 +1642,7 @@ exports.enableAIFund = async (req, res) => {
         let remainingBudget = budget;
   
         const alpacaConfig = await getAlpacaConfig(UserID);
+        if (!alpacaConfig.paper) return res.status(409).json({ status: 'fail', message: 'Use the strategy create/close controls for live execution.' });
         console.log("config key done");
   
         for (let i = 0; i < orderList.length; i++) {
@@ -2164,6 +1939,7 @@ exports.disableAIFund = async (req, res) => {
     
         // Send a sell order for all the stocks in the portfolio
         const alpacaConfig = await getAlpacaConfig(UserID);
+        if (!alpacaConfig.paper) return res.status(409).json({ status: 'fail', message: 'Use the strategy create/close controls for live execution.' });
         const alpacaApi = new Alpaca(alpacaConfig);
     
         let sellOrderPromises = portfolio.stocks.map(stock => {
@@ -4488,6 +4264,7 @@ exports.getPortfolios = async (req, res) => {
               cashBuffer: 1,
               retainedCash: 1,
               initialInvestment: 1,
+              lifecycle: 1, executionState: 1, accounting: 1, realizedPnlValue: 1,
               currentValue: 1,
               pnlValue: 1,
               pnlPercent: 1,
@@ -4541,6 +4318,7 @@ exports.getPortfolios = async (req, res) => {
               cashBuffer: 1,
               retainedCash: 1,
               initialInvestment: 1,
+              lifecycle: 1, executionState: 1, accounting: 1, realizedPnlValue: 1,
               pnlValue: 1,
               pnlPercent: 1,
               budget: 1,
@@ -4579,6 +4357,7 @@ exports.getPortfolios = async (req, res) => {
               },
               polymarket: 1,
               alpaca: 1,
+              lifecycle: 1, executionState: 1, accounting: 1, realizedPnlValue: 1,
             },
           },
         ]).toArray();
@@ -4647,11 +4426,17 @@ exports.getPortfolios = async (req, res) => {
           : (litePerformance.equityValue !== null
             ? roundToTwo(litePerformance.equityValue - liteInitialInvestment)
             : null);
-        const litePnlPercent = portfolio.pnlPercent !== undefined && portfolio.pnlPercent !== null
+        let litePnlPercent = portfolio.pnlPercent !== undefined && portfolio.pnlPercent !== null
           ? toNumber(portfolio.pnlPercent, null)
           : (litePnlValue !== null && liteInitialInvestment > 0
             ? roundToTwo((litePnlValue / liteInitialInvestment) * 100)
             : null);
+
+        if (portfolio.accounting?.reconciledAt) {
+          litePnlPercent = portfolio.accounting.capitalVerified ? litePnlPercent : null;
+          litePerformance.performanceValue = litePnlValue;
+          litePerformance.performancePercent = litePnlPercent;
+        }
 
         return {
           provider,
@@ -4679,7 +4464,12 @@ exports.getPortfolios = async (req, res) => {
           budget: liteBudget,
           cashLimit: liteCashLimit,
           rebalanceCount: toNumber(portfolio.rebalanceCount, 0),
+          lifecycle: portfolio.lifecycle || 'active',
+          executionState: portfolio.executionState || 'idle',
+          accountingStatus: portfolio.accounting?.reconciledAt ? 'reconciled' : 'unverified',
           status: (() => {
+            if (portfolio.lifecycle && portfolio.lifecycle !== 'active') return portfolio.lifecycle;
+            if (['failed', 'partial'].includes(portfolio.executionState)) return portfolio.executionState;
             const next = portfolio.nextRebalanceAt ? new Date(portfolio.nextRebalanceAt) : null;
             const last = portfolio.lastRebalancedAt ? new Date(portfolio.lastRebalancedAt) : null;
             if (next && next <= now) {
@@ -5231,16 +5021,25 @@ exports.getPortfolios = async (req, res) => {
       const storedPnlPercent = portfolio.pnlPercent !== undefined && portfolio.pnlPercent !== null
         ? toNumber(portfolio.pnlPercent, null)
         : null;
-      const pnlValue = computedPnlValue !== null
+      let pnlValue = computedPnlValue !== null
         ? computedPnlValue
         : storedPnlValue !== null
           ? storedPnlValue
           : totalCurrentValue - initialInvestment;
-      const pnlPercent = computedPnlPercent !== null
+      let pnlPercent = computedPnlPercent !== null
         ? computedPnlPercent
         : storedPnlPercent !== null
           ? storedPnlPercent
           : (initialInvestment > 0 ? (pnlValue / initialInvestment) * 100 : null);
+
+      if (portfolio.accounting?.reconciledAt) {
+        const costBasis = stocks.reduce((n, stock) => n + Number(stock.quantity || 0) * Number(stock.avgCost || 0), 0);
+        pnlValue = roundToTwo(Number(portfolio.realizedPnlValue || 0) + totalCurrentValue - costBasis);
+        pnlPercent = portfolio.accounting.capitalVerified && portfolio.accounting.netContributions > 0
+          ? roundToTwo(pnlValue / portfolio.accounting.netContributions * 100) : null;
+        performance.performanceValue = pnlValue;
+        performance.performancePercent = pnlPercent;
+      }
 
       const polymarketRealMoneyFlags =
         provider === 'polymarket'
@@ -5290,7 +5089,12 @@ exports.getPortfolios = async (req, res) => {
         budget,
         cashLimit,
         rebalanceCount: toNumber(portfolio.rebalanceCount, 0),
+        lifecycle: portfolio.lifecycle || 'active',
+        executionState: portfolio.executionState || 'idle',
+        accountingStatus: portfolio.accounting?.reconciledAt ? 'reconciled' : 'unverified',
         status: (() => {
+          if (portfolio.lifecycle && portfolio.lifecycle !== 'active') return portfolio.lifecycle;
+          if (['failed', 'partial'].includes(portfolio.executionState)) return portfolio.executionState;
           const next = portfolio.nextRebalanceAt ? new Date(portfolio.nextRebalanceAt) : null;
           const last = portfolio.lastRebalancedAt ? new Date(portfolio.lastRebalancedAt) : null;
           if (next && next <= now) {

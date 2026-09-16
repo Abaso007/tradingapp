@@ -47,20 +47,25 @@ function scheduleSentimentVertex() {
 }
 
 function schedulePortfolioRebalances() {
+  if (process.env.REBALANCE_SCHEDULER_ENABLED === 'false') {
+    console.warn('[Scheduler] Portfolio execution is disabled by configuration');
+    return;
+  }
   const defaultSchedule = '*/10 * * * * *'; // every 10 seconds
   const schedule = String(process.env.REBALANCE_SCHEDULER_CRON || '').trim() || defaultSchedule;
   console.log('[Scheduler] Portfolio rebalance schedule:', schedule);
 
+  for (const provider of ['alpaca', 'polymarket']) {
   cron.schedule(schedule, async () => {
     try {
-      if (isRebalanceLocked()) {
+      if (isRebalanceLocked(provider)) {
         return;
       }
       if (mongoose.connection.readyState !== 1) {
         console.warn('[Scheduler] MongoDB not connected; skipping rebalance check.');
         return;
       }
-      const result = await runDueRebalances();
+      const result = await runDueRebalances(provider);
       if (result?.skipped) {
         return;
       }
@@ -76,6 +81,7 @@ function schedulePortfolioRebalances() {
       console.error('[Scheduler] Portfolio rebalance check failed:', error.message);
     }
   });
+  }
 }
 
 function schedulePolymarketProxyPoolRefresh() {

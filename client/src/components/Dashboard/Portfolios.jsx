@@ -765,14 +765,22 @@ const deleteStrategy = async (strategyId) => {
       const response = await Axios.delete(url, { headers });
 
       if (response.data.status === "success") {
-        // console.log("Strategy deleted successfully");
-        // You might want to update the state or redirect the user here
+        if (typeof refreshPortfolios === 'function') await refreshPortfolios();
       } else {
         logError('Error deleting strategy:', response.data.message);
       }
     } catch (error) {
       logError('Error deleting strategy:', error);
     }
+  };
+
+  const togglePortfolioPause = async (portfolio) => {
+    try {
+      await Axios.patch(`${config.base_url}/api/strategies/lifecycle/${userData.user.id}/${portfolio.strategy_id}`,
+        { lifecycle: portfolio.lifecycle === 'paused' ? 'active' : 'paused' },
+        { headers: { 'x-auth-token': userData.token } });
+      if (typeof refreshPortfolios === 'function') await refreshPortfolios();
+    } catch (error) { setRecurrenceError(error.response?.data?.message || error.message); }
   };
 
   const handleRecurrenceChange = async (portfolio, newRecurrence) => {
@@ -1230,7 +1238,7 @@ const deleteStrategy = async (strategyId) => {
             : Number.isFinite(Number(portfolio.performanceValue))
               ? Number(portfolio.performanceValue)
               : (equityValue !== null && performanceBaseline !== null ? equityValue - performanceBaseline : null);
-          const performancePercent = hasPending
+          const performancePercent = hasPending || (portfolio.accountingStatus === 'reconciled' && portfolio.performancePercent == null)
             ? null
             : Number.isFinite(Number(portfolio.performancePercent))
               ? Number(portfolio.performancePercent)
@@ -1404,6 +1412,11 @@ const deleteStrategy = async (strategyId) => {
 
               </div>
               <Typography variant="body2" color="textSecondary" sx={{ ml: 6, mt: 0.5 }}>
+                {portfolio.lifecycle !== 'closed' && (
+                  <Button size="small" onClick={() => togglePortfolioPause(portfolio)}>
+                    {portfolio.lifecycle === 'paused' ? 'Resume' : 'Pause'}
+                  </Button>
+                )}
                 Status: {formatStatus(portfolio.status)} · Frequency: {formatRecurrenceLabel(portfolio.recurrence)} · Next reallocation:{' '}
                 <Box component="span" sx={{ display: 'inline-flex', alignItems: 'center' }}>
                   {formatDateTime(portfolio.nextRebalanceAt)}
@@ -1471,8 +1484,10 @@ const deleteStrategy = async (strategyId) => {
                 </Typography>
               ) : (
                 <Typography variant="body2" color="textSecondary" sx={{ ml: 6 }}>
-                  Initial investment: {formatCurrencyValue(initialInvestmentValue)}
-                  {showPerformanceBaseline && (
+                  {portfolio.accountingStatus === 'reconciled' && portfolio.performancePercent == null
+                    ? 'Net contributions not yet verified; return percentage unavailable.'
+                    : <>Initial investment: {formatCurrencyValue(initialInvestmentValue)}</>}
+                  {showPerformanceBaseline && portfolio.accountingStatus !== 'reconciled' && (
                     <> · Performance baseline: {formatCurrencyValue(performanceBaseline)}</>
                   )}
                   {' '}· Holdings value: {currentValue !== null ? formatCurrencyValue(currentValue) : '—'} · Equity: {equityValue !== null ? formatCurrencyValue(equityValue) : '—'}
@@ -1570,7 +1585,7 @@ const deleteStrategy = async (strategyId) => {
                     <div style={{ padding: '20px', backgroundColor: 'white', margin: 'auto', marginTop: '20%', width: '50%' }}>
                       <h2 id="delete-strategy-modal-title">Delete Strategy</h2>
                       <p id="delete-strategy-modal-description">
-                        Are you sure that you want to delete this strategy? This will liquidate the assets.
+                        Close this strategy? Its tracked assets will be sold when the market is open. The strategy remains visible until execution is confirmed, and its history is preserved.
                       </p>
                       <Button variant="contained" color="primary" onClick={closeDeleteModal} style={{ marginRight: '20px' }}>
                         Cancel

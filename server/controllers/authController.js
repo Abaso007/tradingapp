@@ -12,6 +12,9 @@ const errorMessage = (res, error) => {
 };
 exports.registerUser = async (req, res) => {
   try {
+    if (process.env.ALLOW_REGISTRATION !== 'true') {
+      return res.status(403).json({ message: 'Registration is disabled.' });
+    }
     const { username, password } = req.body;
 
     console.log('[Auth] Register attempt received', { username });
@@ -47,7 +50,7 @@ exports.registerUser = async (req, res) => {
     const newUser = new User({ username, password: hashedPassword });
     const savedUser = await newUser.save();
     console.log('[Auth] User saved successfully', { userId: savedUser._id });
-    res.status(201).json(savedUser);
+    res.status(201).json({ id: savedUser._id, username: savedUser.username });
   } catch (error) {
     console.error('[Auth] Register error', error);
     return errorMessage(res, error);
@@ -91,7 +94,7 @@ exports.loginUser = async (req, res) => {
     let ALPACA_API_SECRET_KEY = user.ALPACA_API_SECRET_KEY;
 
     // If user does not have ALPACA_API_KEY_ID and ALPACA_API_SECRET_KEY, use the ones from environment variables and update the user
-    if (!ALPACA_API_KEY_ID || !ALPACA_API_SECRET_KEY) {
+    if (!ALPACA_API_KEY_ID && !ALPACA_API_SECRET_KEY && String(user._id) === process.env.ALPACA_OWNER_USER_ID) {
       console.log('[Auth] User missing Alpaca keys, using environment fallback (not persisted)');
       ALPACA_API_KEY_ID = process.env.ALPACA_API_KEY_ID;
       ALPACA_API_SECRET_KEY = process.env.ALPACA_API_SECRET_KEY;

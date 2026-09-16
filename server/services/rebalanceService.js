@@ -1,3 +1,6 @@
+const { syncLedger } = require('./alpacaLedger');
+const { withBrokerAccountLock } = require('./brokerAccountLock');
+const { beginJournal, executeOrder, recoverJournal, brokerError, headersFor } = require('./alpacaOrderJournal');
 const Portfolio = require('../models/portfolioModel');
 const Strategy = require('../models/strategyModel');
 const StrategyEquitySnapshot = require('../models/strategyEquitySnapshotModel');
@@ -931,13 +934,13 @@ const buildRebalanceReconciliation = ({
 
     if (desiredQty - actualQty > tolerance) {
       if (plannedBuyQty > 0 && executedBuyQty + tolerance < plannedBuyQty) {
-        reasons.push('Buy order not fully executed.');
+        reasons.push('Position below theoretical target; see submitted quantity and broker execution status.');
       } else if (plannedBuyQty === 0 && targetWeight > 0) {
         reasons.push('No buy order was planned for this allocation.');
       }
     } else if (actualQty - desiredQty > tolerance) {
       if (plannedSellQty > 0 && executedSellQty + tolerance < plannedSellQty) {
-        reasons.push('Sell order not fully executed.');
+        reasons.push('Position above theoretical target; see broker execution status.');
       }
     }
 
@@ -1148,7 +1151,7 @@ const buildAdjustments = async ({
     const tracked = trackedHoldings[target.symbol];
     const trackedQty = tracked ? Math.max(0, toNumber(tracked.quantity, 0)) : 0;
     const accountQty = position ? Math.max(0, toNumber(position.qty, 0)) : 0;
-    const currentQty = tracked ? (accountQty > 0 ? Math.min(trackedQty, accountQty) : trackedQty) : 0;
+    const currentQty = tracked ? Math.min(trackedQty, accountQty) : 0;
     const currentPrice = priceCache[target.symbol]
       || toNumber(position?.current_price, toNumber(position?.avg_entry_price, null))
       || toNumber(tracked?.currentPrice, toNumber(tracked?.avgCost, null))
@@ -1219,7 +1222,7 @@ const buildAdjustments = async ({
       }
       const position = positionMap[symbol];
       const accountQty = position ? Math.max(0, toNumber(position.qty, 0)) : 0;
-      const qtyToUse = accountQty > 0 ? Math.min(trackedQty, accountQty) : trackedQty;
+      const qtyToUse = Math.min(trackedQty, accountQty);
       if (!qtyToUse) {
         return;
       }
@@ -1274,11 +1277,12 @@ const fetchLatestTradePrice = async (dataKeys, symbol) => {
   return null;
 };
 
-const rebalancePortfolio = async (portfolio) => {
+const rebalancePortfolioInternal = async (portfolio, assertOwned) => {
   if (!portfolio?.userId || !portfolio?.strategy_id) {
     return;
   }
 
+  if (portfolio.lifecycle === 'closing') portfolio.nextRebalanceManual = true;
   const strategyQuery = { strategy_id: portfolio.strategy_id };
   if (portfolio.userId) {
     strategyQuery.userId = String(portfolio.userId);
@@ -1351,7 +1355,7 @@ const rebalancePortfolio = async (portfolio) => {
   const tradingKeys = alpacaConfig.getTradingKeys();
   const dataKeys = alpacaConfig.getDataKeys();
   const snapshotSizingEnabled =
-    String(process.env.COMPOSER_LOCK_SNAPSHOT_QTY ?? 'true').toLowerCase() !== 'false';
+    false;
   const maxSnapshotDriftPct = normalizePercentValue(
     process.env.COMPOSER_SNAPSHOT_MAX_DRIFT_PCT,
     0.02
@@ -1387,7 +1391,17 @@ const rebalancePortfolio = async (portfolio) => {
     );
   };
 
+  if (!await recoverJournal(portfolio, tradingKeys, assertOwned)) {
+    throw new Error('Unresolved broker orders: awaiting reconciliation; no new orders submitted');
+  }
+  if (portfolio.accounting?.activityStart) {
+    await syncLedger(portfolio, tradingKeys);
+    await assertOwned();
+    await portfolio.save();
+  }
+  if (portfolio.lifecycle === 'paused') return;
   const clockData = await fetchMarketClock(tradingKeys);
+  if (!clockData || typeof clockData.is_open !== 'boolean') throw new Error('Market clock unavailable; execution stopped');
   if (clockData && clockData.is_open === false) {
     const fallbackNext = computeNextRebalanceAt(recurrence, now);
     const nextOpen = clockData.next_open ? new Date(clockData.next_open) : null;
@@ -1502,7 +1516,14 @@ const rebalancePortfolio = async (portfolio) => {
     }),
   ]);
 
-  const positions = Array.isArray(positionsResponse.data) ? positionsResponse.data : [];
+  if (!Array.isArray(positionsResponse.data)) throw new Error('Invalid broker positions response');
+  if (!Number.isFinite(Number(accountResponse.data?.cash))) throw new Error('Invalid broker cash response');
+  if (accountResponse.data?.trading_blocked || accountResponse.data?.account_blocked) throw new Error('Broker account is blocked');
+  const openOrders = await tradingKeys.client.get(`${tradingKeys.apiUrl}/v2/orders`, {
+    headers: headersFor(tradingKeys), params: { status: 'open', limit: 500 },
+  });
+  if (!Array.isArray(openOrders.data) || openOrders.data.length) throw new Error('Open or unknown account orders must be reconciled before rebalancing');
+  const positions = positionsResponse.data;
   const accountCash = toNumber(accountResponse.data?.cash, 0);
   const positionMap = {};
   const priceCache = {};
@@ -1523,6 +1544,10 @@ const rebalancePortfolio = async (portfolio) => {
   });
 
   holdingsState.forEach((entry, symbol) => {
+    const brokerQty = Math.max(0, toNumber(positionMap[symbol]?.qty, 0));
+    if (Math.abs(brokerQty - entry.quantity) > 0.000001) {
+      throw new Error(`Position reconciliation required for ${symbol}: strategy ${entry.quantity}, broker ${brokerQty}. No orders submitted.`);
+    }
     trackedHoldings[symbol] = entry;
     holdingsSnapshot.set(symbol, { ...entry });
     if (priceCache[symbol] == null) {
@@ -1544,7 +1569,7 @@ const rebalancePortfolio = async (portfolio) => {
     }
     const position = positionMap[symbol];
     const accountQty = position ? Math.max(0, toNumber(position.qty, 0)) : 0;
-    const effectiveQty = accountQty > 0 ? Math.min(trackedQty, accountQty) : trackedQty;
+    const effectiveQty = Math.min(trackedQty, accountQty);
     const price =
       priceCache[symbol]
       || toNumber(position?.current_price, toNumber(position?.avg_entry_price, null))
@@ -1576,7 +1601,12 @@ const rebalancePortfolio = async (portfolio) => {
     return toNumber(portfolio.cashBuffer, 0);
   })();
   const cashBuffer = retainedProfits;
-  let strategyCash = Math.max(0, cashBuffer);
+  let strategyCash = Math.min(Math.max(0, cashBuffer), Math.max(0, accountCash));
+  // Never label account cash from another strategy/personal holding as ours.
+  // A historical allocation discrepancy is recorded for explicit reconciliation.
+  if (cashBuffer > accountCash + 0.02 && accountCash >= 0) {
+    baseThoughtProcess.reasoning.push('Strategy cash capped to broker cash; historical cash allocation requires reconciliation.');
+  }
   const startingStrategyCash = strategyCash;
   const cashLimit = toNumber(portfolio.cashLimit, toNumber(portfolio.budget, null));
   const baseLimit = cashLimit && cashLimit > 0
@@ -1598,7 +1628,7 @@ const rebalancePortfolio = async (portfolio) => {
 
   let composerEvaluation = null;
   let composerUsedIncompleteUniverse = false;
-  if (strategy?.strategy && /\(defsymphony/i.test(strategy.strategy)) {
+  if (portfolio.lifecycle !== 'closing' && strategy?.strategy && /\(defsymphony/i.test(strategy.strategy)) {
     const composerBudget = budget > 0 ? budget : currentTotal || accountCash;
     if (composerBudget && composerBudget > 0) {
       try {
@@ -1614,6 +1644,7 @@ const rebalancePortfolio = async (portfolio) => {
           return Number.isFinite(parsed) && parsed > 0 ? Math.floor(parsed) : 3;
         })();
         const canRetryIncompleteUniverse =
+          actualExecutionMode !== 'live' &&
           error?.code === 'INSUFFICIENT_MARKET_DATA' &&
           missingSymbols.length > 0 &&
           missingSymbols.length <= maxMissingForFallback;
@@ -1735,13 +1766,30 @@ const rebalancePortfolio = async (portfolio) => {
     }
   }
 
-  if (!normalizedTargets.length) {
-    throw new Error('No target positions available for rebalancing');
-  }
+  if (portfolio.lifecycle === 'closing') normalizedTargets = [];
+  if (!normalizedTargets.length && portfolio.lifecycle !== 'closing') throw new Error('No target positions available for rebalancing');
 
   const targetWeightSum = normalizedTargets.reduce((sum, target) => sum + target.targetWeight, 0);
-  if (targetWeightSum <= 0) {
+  if (targetWeightSum <= 0 && portfolio.lifecycle !== 'closing') {
     throw new Error('Target weights are invalid');
+  }
+
+  for (const target of normalizedTargets) {
+    if (Number(positionMap[target.symbol]?.qty || 0) !== 0 && !trackedHoldings[target.symbol]) {
+      throw new Error(`Unattributed account position in target ${target.symbol}; execution stopped`);
+    }
+  }
+  if (actualExecutionMode === 'live') {
+    const symbols = [...new Set([...normalizedTargets.map((t) => t.symbol), ...Object.keys(trackedHoldings)])];
+    for (const symbol of symbols) {
+      const { data } = await dataKeys.client.get(`${dataKeys.apiUrl}/v2/stocks/${symbol}/trades/latest`, { headers: headersFor(dataKeys) });
+      const timestamp = Date.parse(data?.trade?.t);
+      const age = Date.now() - timestamp;
+      if (!Number.isFinite(timestamp) || age < -60000 || age > 5 * 60 * 1000 || !(Number(data?.trade?.p) > 0)) {
+        throw new Error(`Fresh market data unavailable for ${symbol}; execution stopped`);
+      }
+      priceCache[symbol] = Number(data.trade.p);
+    }
   }
 
   const adjustments = await buildAdjustments({
@@ -1762,7 +1810,7 @@ const rebalancePortfolio = async (portfolio) => {
 
   adjustments.forEach((adjustment) => {
     const qtyDiff = adjustment.desiredQty - adjustment.currentQty;
-    if (qtyDiff < 0 && Math.abs(qtyDiff) > TOLERANCE) {
+    if (qtyDiff < 0 && (Math.abs(qtyDiff) > TOLERANCE || portfolio.lifecycle === 'closing')) {
       const qtyToSell = Math.min(adjustment.currentQty, Math.abs(qtyDiff));
       if (qtyToSell > 0) {
         sells.push({
@@ -1784,240 +1832,67 @@ const rebalancePortfolio = async (portfolio) => {
     }
   });
 
+  const executionErrors = [];
+  const sizingReductions = [];
   let sellProceeds = 0;
-  for (const sell of sells) {
-    const normalized = normalizeQtyForOrder(sell.qty);
-    if (!normalized.qty) {
-      continue;
-    }
-    const estimatedNotional = normalized.qty * sell.price;
-    if (normalized.isFractional && estimatedNotional < MIN_FRACTIONAL_NOTIONAL) {
-      continue;
-    }
-    try {
-      const response = await placeOrder(
-        tradingKeys,
-        buildMarketOrderPayload({
-          symbol: sell.symbol,
-          side: 'sell',
-          qty: normalized.qty,
-          isFractional: ENABLE_FRACTIONAL_ORDERS && normalized.isFractional,
-        })
-      );
-      const orderId = response?.data?.client_order_id || response?.data?.id || null;
-      sellProceeds += normalized.qty * sell.price;
-      executedSells.push({
-        symbol: sell.symbol,
-        qty: normalized.qty,
-        price: sell.price,
-        orderId,
-      });
-    } catch (error) {
-      if (ENABLE_FRACTIONAL_ORDERS && normalized.isFractional && shouldFallbackToWholeShares(error)) {
-        const wholeDiff = computeWholeShareQtyDiff(sell.currentQty, sell.desiredQty);
-        const fallbackQty = Math.max(0, -wholeDiff);
-        if (fallbackQty > 0) {
-          try {
-            const response = await placeOrder(
-              tradingKeys,
-              buildMarketOrderPayload({
-                symbol: sell.symbol,
-                side: 'sell',
-                qty: fallbackQty,
-                isFractional: false,
-              })
-            );
-            const orderId = response?.data?.client_order_id || response?.data?.id || null;
-            sellProceeds += fallbackQty * sell.price;
-            executedSells.push({
-              symbol: sell.symbol,
-              qty: fallbackQty,
-              price: sell.price,
-              orderId,
-            });
-            recordFallback({ symbol: sell.symbol, side: 'sell', error, qty: fallbackQty });
-            continue;
-          } catch (fallbackError) {
-            console.error(
-              `[Rebalance] Sell order failed for ${sell.symbol} (fractional + fallback):`,
-              fallbackError.message
-            );
-          }
-        }
-      }
-      console.error(`[Rebalance] Sell order failed for ${sell.symbol}:`, error.message);
-    }
-  }
-
-  let realizedPnlDelta = 0;
-  executedSells.forEach((sell) => {
-    const snapshot = holdingsSnapshot.get(sell.symbol);
-    if (!snapshot) {
-      return;
-    }
-    const avgCost = toNumber(snapshot.avgCost, null);
-    const availableQty = Math.max(0, toNumber(snapshot.quantity, 0));
-    const qtySold = Math.min(Math.abs(sell.qty), availableQty);
-    if (!qtySold || !Number.isFinite(avgCost)) {
-      return;
-    }
-    realizedPnlDelta += (sell.price - avgCost) * qtySold;
-    snapshot.quantity = Math.max(0, availableQty - qtySold);
-  });
-
-  strategyCash += sellProceeds;
-  const actualCashAvailable = Math.max(0, accountCash + sellProceeds);
-  let availableCash = Math.min(budget, strategyCash, actualCashAvailable);
   let buySpend = 0;
-
-  for (const buy of buys) {
-    const normalized = normalizeQtyForOrder(buy.qty);
-    if (!normalized.qty) {
-      continue;
+  let realizedPnlDelta = 0;
+  let availableCash = 0;
+  const baselineRealized = toNumber(portfolio.realizedPnlValue, 0);
+  // Baseline cash is bounded by the broker before the journal is persisted.
+  portfolio.retainedCash = strategyCash;
+  portfolio.cashBuffer = strategyCash;
+  await beginJournal(portfolio, assertOwned);
+  let unresolved = false;
+  const submit = async (plan, side, qty) => {
+    const normalized = normalizeQtyForOrder(qty);
+    if (!normalized.qty || (side === 'buy' && normalized.qty * plan.price < MIN_FRACTIONAL_NOTIONAL)) return null;
+    const submissionClock = await fetchMarketClock(tradingKeys);
+    if (submissionClock?.is_open !== true) throw new Error('Market not confirmed open at submission; execution stopped');
+    const fill = await executeOrder(portfolio, tradingKeys, buildMarketOrderPayload({
+      symbol: plan.symbol, side, qty: normalized.qty,
+      isFractional: ENABLE_FRACTIONAL_ORDERS && normalized.isFractional,
+    }), assertOwned);
+    if (!fill.terminal) unresolved = true;
+    if (fill.status !== 'filled' || fill.qty < fill.submittedQty - 0.000001) {
+      executionErrors.push({ symbol: plan.symbol, side, status: fill.status, submittedQty: fill.submittedQty,
+        filledQty: fill.qty, brokerId: fill.orderId, error: fill.error || null });
     }
-    const estimatedCost = normalized.qty * buy.price;
-    if (normalized.isFractional && estimatedCost < MIN_FRACTIONAL_NOTIONAL) {
-      continue;
+    return fill;
+  };
+  for (const sell of sells) {
+    const fill = await submit(sell, 'sell', sell.qty);
+    if (fill?.qty > 0) {
+      sellProceeds += fill.qty * fill.price;
+      executedSells.push(fill);
+      const snapshot = holdingsSnapshot.get(fill.symbol);
+      realizedPnlDelta += fill.qty * (fill.price - toNumber(snapshot?.avgCost, 0));
     }
-    if (estimatedCost <= availableCash) {
-      try {
-        const response = await placeOrder(
-          tradingKeys,
-          buildMarketOrderPayload({
-            symbol: buy.symbol,
-            side: 'buy',
-            qty: normalized.qty,
-            isFractional: ENABLE_FRACTIONAL_ORDERS && normalized.isFractional,
-          })
-        );
-        const orderId = response?.data?.client_order_id || response?.data?.id || null;
-        const filledPrice = await fetchOrderFillPrice(tradingKeys, orderId);
-        const executionPrice = Number.isFinite(filledPrice) && filledPrice > 0 ? filledPrice : buy.price;
-        const actualCost = executionPrice * normalized.qty;
-        availableCash -= actualCost;
-        strategyCash = Math.max(0, strategyCash - actualCost);
-        buySpend += actualCost;
-        executedBuys.push({
-          symbol: buy.symbol,
-          qty: normalized.qty,
-          price: executionPrice,
-          orderId,
-        });
-      } catch (error) {
-        if (ENABLE_FRACTIONAL_ORDERS && normalized.isFractional && shouldFallbackToWholeShares(error)) {
-          const wholeDiff = computeWholeShareQtyDiff(buy.currentQty, buy.desiredQty);
-          const fallbackQty = Math.max(0, wholeDiff);
-          if (fallbackQty > 0) {
-            try {
-              const response = await placeOrder(
-                tradingKeys,
-                buildMarketOrderPayload({
-                  symbol: buy.symbol,
-                  side: 'buy',
-                  qty: fallbackQty,
-                  isFractional: false,
-                })
-              );
-              const orderId = response?.data?.client_order_id || response?.data?.id || null;
-              const filledPrice = await fetchOrderFillPrice(tradingKeys, orderId);
-              const executionPrice = Number.isFinite(filledPrice) && filledPrice > 0 ? filledPrice : buy.price;
-              const actualCost = executionPrice * fallbackQty;
-              availableCash -= actualCost;
-              strategyCash = Math.max(0, strategyCash - actualCost);
-              buySpend += actualCost;
-              executedBuys.push({
-                symbol: buy.symbol,
-                qty: fallbackQty,
-                price: executionPrice,
-                orderId,
-              });
-              recordFallback({ symbol: buy.symbol, side: 'buy', error, qty: fallbackQty });
-              continue;
-            } catch (fallbackError) {
-              console.error(
-                `[Rebalance] Buy order failed for ${buy.symbol} (fractional + fallback):`,
-                fallbackError.message
-              );
-            }
-          }
-        }
-        console.error(`[Rebalance] Buy order failed for ${buy.symbol}:`, error.message);
-      }
-    } else {
-      const rawAffordableQty = availableCash / buy.price;
-      const affordableQty = ENABLE_FRACTIONAL_ORDERS
-        ? Math.min(toNumber(buy.qty, 0), rawAffordableQty)
-        : Math.min(toNumber(buy.qty, 0), Math.floor(rawAffordableQty));
-      const normalizedAffordable = normalizeQtyForOrder(affordableQty);
-      if (normalizedAffordable.qty) {
-        const estimatedAffordableCost = normalizedAffordable.qty * buy.price;
-        if (normalizedAffordable.isFractional && estimatedAffordableCost < MIN_FRACTIONAL_NOTIONAL) {
-          continue;
-        }
-        try {
-          const response = await placeOrder(
-            tradingKeys,
-            buildMarketOrderPayload({
-              symbol: buy.symbol,
-              side: 'buy',
-              qty: normalizedAffordable.qty,
-              isFractional: ENABLE_FRACTIONAL_ORDERS && normalizedAffordable.isFractional,
-            })
-          );
-          const orderId = response?.data?.client_order_id || response?.data?.id || null;
-          const filledPrice = await fetchOrderFillPrice(tradingKeys, orderId);
-          const executionPrice = Number.isFinite(filledPrice) && filledPrice > 0 ? filledPrice : buy.price;
-          const actualCost = executionPrice * normalizedAffordable.qty;
-          availableCash -= actualCost;
-          strategyCash = Math.max(0, strategyCash - actualCost);
-          buySpend += actualCost;
-          executedBuys.push({
-            symbol: buy.symbol,
-            qty: normalizedAffordable.qty,
-            price: executionPrice,
-            orderId,
-          });
-        } catch (error) {
-          if (ENABLE_FRACTIONAL_ORDERS && normalizedAffordable.isFractional && shouldFallbackToWholeShares(error)) {
-            const fallbackQty = Math.floor(toNumber(affordableQty, 0));
-            if (fallbackQty > 0) {
-              try {
-                const response = await placeOrder(
-                  tradingKeys,
-                  buildMarketOrderPayload({
-                    symbol: buy.symbol,
-                    side: 'buy',
-                    qty: fallbackQty,
-                    isFractional: false,
-                  })
-                );
-                const orderId = response?.data?.client_order_id || response?.data?.id || null;
-                const filledPrice = await fetchOrderFillPrice(tradingKeys, orderId);
-                const executionPrice = Number.isFinite(filledPrice) && filledPrice > 0 ? filledPrice : buy.price;
-                const actualCost = executionPrice * fallbackQty;
-                availableCash -= actualCost;
-                strategyCash = Math.max(0, strategyCash - actualCost);
-                buySpend += actualCost;
-                executedBuys.push({
-                  symbol: buy.symbol,
-                  qty: fallbackQty,
-                  price: executionPrice,
-                  orderId,
-                });
-                recordFallback({ symbol: buy.symbol, side: 'buy', error, qty: fallbackQty });
-                continue;
-            } catch (fallbackError) {
-              console.error(
-                `[Rebalance] Partial buy order failed for ${buy.symbol} (fractional + fallback):`,
-                fallbackError.message
-              );
-            }
-          }
-        }
-          console.error(`[Rebalance] Partial buy order failed for ${buy.symbol}:`, error.message);
-        }
-      }
+    if (unresolved) break;
+  }
+  strategyCash += sellProceeds;
+  // Sell proceeds are not buying power until Alpaca reports them available.
+  const refreshedAccount = await tradingKeys.client.get(`${tradingKeys.apiUrl}/v2/account`, { headers: headersFor(tradingKeys) });
+  const brokerCash = Number(refreshedAccount.data?.cash);
+  if (!Number.isFinite(brokerCash)) throw new Error('Unable to confirm cash after sales');
+  const buyingPower = Number(refreshedAccount.data?.buying_power ?? brokerCash);
+  const spendable = Math.max(0, Math.min(brokerCash, buyingPower));
+  const reserve = Math.max(0.05, spendable * 0.005);
+  availableCash = Math.max(0, Math.min(budget, strategyCash, spendable - reserve));
+  // Failed/unsettled sells stop the buy phase. A later cycle re-evaluates targets.
+  if (!executionErrors.length && !unresolved) for (const buy of buys) {
+    const affordable = Math.min(buy.qty, availableCash / buy.price);
+    const qty = ENABLE_FRACTIONAL_ORDERS ? Math.floor(affordable * 1e6) / 1e6 : Math.floor(affordable);
+    if (qty < buy.qty - 0.000001) sizingReductions.push({ symbol: buy.symbol, requestedQty: buy.qty, submittedQty: qty, reason: 'cash_and_execution_reserve' });
+    const fill = await submit(buy, 'buy', qty);
+    if (fill?.qty > 0) {
+      const cost = fill.qty * fill.price;
+      availableCash = Math.max(0, availableCash - cost);
+      strategyCash -= cost;
+      buySpend += cost;
+      executedBuys.push(fill);
     }
+    if (unresolved || executionErrors.length) break;
   }
 
   executedSells.forEach((sell) => {
@@ -2073,7 +1948,7 @@ const rebalancePortfolio = async (portfolio) => {
   const rawPnlPercent = totalCostBasis > 0 ? (rawPnlValue / totalCostBasis) * 100 : 0;
   const unrealizedPnlValue = roundToTwo(rawPnlValue);
   const unrealizedPnlPercent = roundToTwo(rawPnlPercent);
-  const previousRealized = toNumber(portfolio.realizedPnlValue, 0);
+  const previousRealized = baselineRealized;
   const updatedRealized = roundToTwo((previousRealized || 0) + realizedPnlDelta);
   portfolio.realizedPnlValue = updatedRealized !== null ? updatedRealized : previousRealized;
   const totalPnlValue = roundToTwo((unrealizedPnlValue || 0) + (portfolio.realizedPnlValue || 0));
@@ -2085,14 +1960,8 @@ const rebalancePortfolio = async (portfolio) => {
     ? roundToTwo(Math.max(0, totalMarketValue))
     : null;
   portfolio.pnlValue = totalPnlValue !== null ? totalPnlValue : 0;
-  portfolio.pnlPercent = normalizedPnlPercent !== null ? normalizedPnlPercent : 0;
+  portfolio.pnlPercent = portfolio.accounting && !portfolio.accounting.capitalVerified ? null : (normalizedPnlPercent !== null ? normalizedPnlPercent : 0);
   portfolio.lastPerformanceComputedAt = now;
-  if (Number.isFinite(totalCostBasis) && totalCostBasis > 0) {
-    const existingInitial = Math.max(0, toNumber(portfolio.initialInvestment, 0));
-    if (totalCostBasis > existingInitial) {
-      portfolio.initialInvestment = roundToTwo(totalCostBasis);
-    }
-  }
 
   const decisionTrace = adjustments.map((adjustment) => {
     const qtyDiff = adjustment.desiredQty - adjustment.currentQty;
@@ -2155,11 +2024,24 @@ const rebalancePortfolio = async (portfolio) => {
   if (!portfolio.initialInvestment) {
     portfolio.initialInvestment = Math.max(0, buySpend);
   }
-  portfolio.rebalanceCount = (toNumber(portfolio.rebalanceCount, 0) || 0) + 1;
+  portfolio.executionState = executionErrors.length
+    ? (executedSells.length || executedBuys.length ? 'partial' : 'failed') : 'completed';
+  portfolio.executionJournal.committed = !unresolved;
+  portfolio.markModified?.('executionJournal');
+  portfolio.executionAttempts = executionErrors.length ? (portfolio.executionAttempts || 0) + 1 : 0;
+  if (!executionErrors.length) portfolio.rebalanceCount = (toNumber(portfolio.rebalanceCount, 0) || 0) + 1;
   portfolio.lastRebalancedAt = now;
   const provisionalNext = computeNextRebalanceAt(recurrence, now);
   const alignedNext = await alignToAutomaticRebalanceSlot(tradingKeys, recurrence, provisionalNext);
   portfolio.nextRebalanceAt = alignedNext || provisionalNext;
+  if (executionErrors.length) {
+    portfolio.nextRebalanceAt = new Date(Date.now() + 60000);
+    if (portfolio.executionAttempts >= 3) portfolio.lifecycle = 'paused';
+  }
+  if (portfolio.lifecycle === 'closing' && !unresolved && !(portfolio.stocks || []).some((s) => s.quantity > 0)) {
+    portfolio.lifecycle = 'closed';
+    portfolio.nextRebalanceAt = null;
+  }
   portfolio.nextRebalanceManual = false;
   portfolio.recurrence = recurrence;
 
@@ -2238,8 +2120,10 @@ const rebalancePortfolio = async (portfolio) => {
     strategyId: portfolio.strategy_id,
     userId: portfolio.userId,
     strategyName: portfolio.name,
-    message: 'Portfolio rebalanced',
+    level: executionErrors.length ? 'error' : 'info',
+    message: executionErrors.length ? `Portfolio rebalance ${portfolio.executionState}` : 'Portfolio rebalanced',
     details: {
+      executionState: portfolio.executionState, executionErrors, sizingReductions,
       recurrence,
       sells: executedSells.map((sell) => ({
         symbol: sell.symbol,
@@ -2263,12 +2147,39 @@ const rebalancePortfolio = async (portfolio) => {
       accountCash: roundToTwo(accountCash),
       reconciliation,
       thoughtProcess,
-      humanSummary,
+      humanSummary: executionErrors.length ? `Rebalance ${portfolio.executionState}. ${executionErrors.map((e) => `${e.symbol}: ${e.error?.message || e.status}`).join('; ')}\n${humanSummary}` : humanSummary,
     },
   });
 };
 
-let rebalanceInProgress = false;
+const rebalancePortfolio = async (input) => {
+  if (!input?.userId || !input?.strategy_id) return;
+  if (input.lifecycle === 'closed' || (input.lifecycle === 'paused' && input.executionJournal?.committed !== false)) throw new Error('Portfolio is paused or closed');
+  const config = await getAlpacaConfig(input.userId, input.alpaca?.executionMode);
+  return withBrokerAccountLock(config.getTradingKeys(), async (assertOwned) => {
+    const portfolio = input.$__ ? await Portfolio.findById(input._id) : input;
+    if (!portfolio || portfolio.lifecycle === 'closed' || (portfolio.lifecycle === 'paused' && portfolio.executionJournal?.committed !== false)) throw new Error('Portfolio is paused, closed or missing');
+    try {
+      // A pending journal on the same app account must be recovered first.
+      const pending = await Portfolio.findOne({ userId: String(portfolio.userId),
+        _id: { $ne: portfolio._id }, provider: { $ne: 'polymarket' },
+        'alpaca.executionMode': portfolio.alpaca?.executionMode || 'paper',
+        'executionJournal.committed': false });
+      if (pending) throw new Error('Another portfolio has unresolved broker orders');
+      return await rebalancePortfolioInternal(portfolio, assertOwned);
+    } catch (error) {
+      await assertOwned();
+      portfolio.executionState = 'failed';
+      portfolio.executionAttempts = (portfolio.executionAttempts || 0) + 1;
+      portfolio.nextRebalanceAt = new Date(Date.now() + 60000);
+      if (portfolio.executionAttempts >= 3) portfolio.lifecycle = 'paused';
+      await portfolio.save();
+      throw error;
+    }
+  });
+};
+
+const rebalanceLocks = new Set();
 let lastLockSkipLogAtMs = 0;
 
 const REBALANCE_LOCK_SKIP_LOG_THROTTLE_MS = (() => {
@@ -2291,11 +2202,11 @@ const REBALANCE_MAX_CONCURRENCY = (() => {
   return Math.max(1, Math.min(Math.floor(raw), 32));
 })();
 
-const withRebalanceLock = async (handler) => {
-  if (rebalanceInProgress) {
+const withRebalanceLock = async (handler, provider = 'alpaca') => {
+  if (rebalanceLocks.has(provider)) {
     throw new Error('Rebalance already in progress');
   }
-  rebalanceInProgress = true;
+  rebalanceLocks.add(provider);
   let timer;
   const startedAtMs = Date.now();
   try {
@@ -2309,15 +2220,21 @@ const withRebalanceLock = async (handler) => {
     return await handler();
   } finally {
     if (timer) clearTimeout(timer);
-    rebalanceInProgress = false;
+    rebalanceLocks.delete(provider);
   }
 };
 
-const runDueRebalances = async () => {
+const runDueRebalances = async (provider = null) => {
+  if (!provider) {
+    const results = await Promise.all(['alpaca', 'polymarket'].map((p) => runDueRebalances(p)));
+    return { ok: true, due: results.reduce((n, r) => n + (r.due || 0), 0), processed: results.reduce((n, r) => n + (r.processed || 0), 0), results };
+  }
   try {
     return await withRebalanceLock(async () => {
       const now = new Date();
       let duePortfoliosQuery = Portfolio.find({
+        provider: provider === 'alpaca' ? { $ne: 'polymarket' } : 'polymarket',
+        $and: [{ $or: [{ lifecycle: { $nin: ['paused', 'closed'] } }, { 'executionJournal.committed': false }] }],
         recurrence: { $exists: true },
         $or: [
           { nextRebalanceAt: null },
@@ -2425,7 +2342,7 @@ const runDueRebalances = async () => {
         processed,
         concurrency: workerCount,
       };
-    });
+    }, provider);
   } catch (error) {
     if (String(error?.message || '').includes('Rebalance already in progress')) {
       const nowMs = Date.now();
@@ -2439,7 +2356,7 @@ const runDueRebalances = async () => {
   }
 };
 
-const rebalanceNow = async ({ strategyId, userId, mode = null }) => withRebalanceLock(async () => {
+const rebalanceNow = async ({ strategyId, userId, mode = null }) => {
   if (!strategyId || !userId) {
     throw new Error('strategyId and userId are required');
   }
@@ -2456,10 +2373,10 @@ const rebalanceNow = async ({ strategyId, userId, mode = null }) => withRebalanc
   } else {
     await rebalancePortfolio(portfolio);
   }
-});
+};
 
-const isRebalanceLocked = () => rebalanceInProgress;
-const resetRebalanceLock = () => { rebalanceInProgress = false; };
+const isRebalanceLocked = (provider = 'alpaca') => rebalanceLocks.has(provider);
+const resetRebalanceLock = () => { rebalanceLocks.clear(); };
 
 module.exports = {
   runDueRebalances,

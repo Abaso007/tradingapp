@@ -2,7 +2,6 @@ const mongoose = require("mongoose");
 const User = require("../models/userModel");
 const Stock = require("../models/stockModel");
 const data = require("../config/stocksData");
-const Alpaca = require('@alpacahq/alpaca-trade-api');
 const Axios = require("axios");
 const moment = require('moment');
 const AlpacaClient = require('../utils/alpacaClient');
@@ -405,6 +404,7 @@ exports.editAccount = async (req, res) => {
       },
       { new: true }
     );
+
 
     if (!updatedUser) {
       return res.status(404).json({
