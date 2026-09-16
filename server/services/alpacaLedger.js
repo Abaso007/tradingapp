@@ -84,6 +84,9 @@ const syncLedger = async (portfolio, keys, { persistEntries = true } = {}) => {
   if (!Array.isArray(orders.data) || orders.data.length) throw new Error('Ledger reconciliation requires no open orders');
   if (!Array.isArray(positions.data)) throw new Error('Invalid positions');
   const result = reconcileActivities({ activities, positions: positions.data, universe: config.universe, includeAccountFees: config.includeAccountFees });
+  if (config.includeAccountFees && result.unallocated.length) {
+    throw new Error('Account fees cannot be attributed after unrelated trades; reconcile allocations before continuing');
+  }
   if (persistEntries && result.ledger.length) {
     const mongoose = require('mongoose');
     await mongoose.connection.collection('strategyLedger').bulkWrite(result.ledger.map((entry) => ({

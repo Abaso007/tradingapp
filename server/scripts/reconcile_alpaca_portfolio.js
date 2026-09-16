@@ -38,6 +38,10 @@ const pick = (p) => ({ stocks: p.stocks, retainedCash: p.retainedCash, cashBuffe
     if (apply) {
       const inspected = JSON.parse(fs.readFileSync(output, 'utf8'));
       if (option('--plan-hash') !== hash(inspected) || inspected.beforeHash !== currentHash) throw new Error('Plan/state changed: perform a new dry run');
+      const scope = inspected.after?.accounting;
+      if (inspected.strategyId !== id || scope?.activityStart !== after || JSON.stringify(scope?.universe) !== JSON.stringify(universe) || scope?.includeAccountFees !== args.includes('--include-account-fees')) {
+        throw new Error('Reconciliation scope differs from the inspected plan');
+      }
     }
     p.accounting = { ...(p.accounting || {}), activityStart: after, universe, includeAccountFees: args.includes('--include-account-fees'), capitalVerified: false,
       legacyInitialInvestment: p.accounting?.legacyInitialInvestment ?? p.initialInvestment };
