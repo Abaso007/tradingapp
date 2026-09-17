@@ -39,7 +39,10 @@ const fixture = ({ cash = 100, stocks = [], positions = [], reject = false, open
     targetPositions: [{ symbol: 'SOXL', targetWeight: 1 }], stocks, save: jest.fn(async () => p), markModified: jest.fn() };
   return { p, client };
 };
-beforeEach(() => jest.clearAllMocks());
+beforeEach(() => {
+  jest.clearAllMocks();
+  require('../../models/strategyModel').findOne.mockResolvedValue({ strategy: 'static targets' });
+});
 it('uses confirmed cash after selling and leaves an execution reserve', async () => {
   const { p, client } = fixture({ cash: -10, stocks: [{ symbol: 'SPY', quantity: 1, avgCost: 90, orderID: 'old' }], positions: [{ symbol: 'SPY', qty: 1, current_price: 100 }] });
   await rebalancePortfolio(p);
@@ -85,4 +88,50 @@ it('closes only strategy-owned holdings after confirmed sales, keeping the recor
   expect(p.lifecycle).toBe('closed');
   expect(p.stocks).toEqual([]);
   expect(client.post.mock.calls.map((c) => c[1].symbol)).toEqual(['SOXL']);
+});
+
+const useThresholdStrategy = () => {
+  require('../../models/strategyModel').findOne.mockResolvedValue({
+    strategy: '(defsymphony "Threshold" {:rebalance-threshold 0.069} (asset "SOXL"))',
+  });
+  require('../../utils/openaiComposerStrategy').runComposerStrategy.mockResolvedValue({
+    positions: [{ symbol: 'SOXL', weight: 1, quantity: 1, estimated_cost: 100 }],
+  });
+};
+it('keeps holdings and strategy cash when drift is within the 6.9% corridor', async () => {
+  useThresholdStrategy();
+  const { p, client } = fixture({ cash: 4, stocks: [{ symbol: 'SOXL', quantity: .96, avgCost: 90 }],
+    positions: [{ symbol: 'SOXL', qty: .96, current_price: 100 }, { symbol: 'NVDA', qty: .436, current_price: 200 }] });
+  await rebalancePortfolio(p);
+  expect(client.post).not.toHaveBeenCalled();
+  expect(p.retainedCash).toBe(4);
+  expect(p.stocks[0].quantity).toBe(.96);
+  expect(p.executionState).toBe('completed');
+});
+it('buys when cash drift exceeds the corridor, retaining the execution reserve', async () => {
+  useThresholdStrategy();
+  const { p, client } = fixture({ cash: 10, stocks: [{ symbol: 'SOXL', quantity: .9, avgCost: 90 }],
+    positions: [{ symbol: 'SOXL', qty: .9, current_price: 100 }] });
+  await rebalancePortfolio(p);
+  expect(client.post).toHaveBeenCalledTimes(1);
+  expect(client.post.mock.calls[0][1]).toMatchObject({ symbol: 'SOXL', side: 'buy' });
+  expect(Number(client.post.mock.calls[0][1].qty)).toBeCloseTo(.0995, 5);
+  expect(Number(client.post.mock.calls[0][1].qty) * 100).toBeLessThanOrEqual(9.95);
+});
+it('honors the budget cap even for a sale smaller than the old share tolerance', async () => {
+  useThresholdStrategy();
+  const { p, client } = fixture({ cash: 0, stocks: [{ symbol: 'SOXL', quantity: 1.005, avgCost: 90 }],
+    positions: [{ symbol: 'SOXL', qty: 1.005, current_price: 100 }] });
+  await rebalancePortfolio(p);
+  expect(client.post.mock.calls[0][1]).toMatchObject({ symbol: 'SOXL', side: 'sell', qty: '0.005000' });
+  expect(p.stocks[0].quantity).toBeCloseTo(1);
+});
+it('liquidates a small old target when changing ETF despite its fractional size', async () => {
+  useThresholdStrategy();
+  const { p, client } = fixture({ cash: 99.5, stocks: [{ symbol: 'SPXU', quantity: .005, avgCost: 90 }],
+    positions: [{ symbol: 'SPXU', qty: .005, current_price: 100 }] });
+  await rebalancePortfolio(p);
+  expect(client.post.mock.calls.map(c => c[1].side)).toEqual(['sell', 'buy']);
+  expect(client.post.mock.calls[0][1]).toMatchObject({ symbol: 'SPXU', qty: '0.005000' });
+  expect(p.stocks.map(s => s.symbol)).toEqual(['SOXL']);
 });

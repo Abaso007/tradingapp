@@ -138,4 +138,32 @@ describe('priceCacheService source priority', () => {
     const urls = Axios.get.mock.calls.map((call) => String(call[0]));
     expect(urls.some((u) => u.includes('stooq.com/q/d/l/'))).toBe(true);
   });
+
+  it('fails when adjusted sources are unavailable instead of using raw Stooq data', async () => {
+    jest.doMock('axios', () => ({ get: jest.fn(), create: jest.fn() }));
+    jest.doMock('../../config/alpacaConfig', () => ({ getAlpacaConfig: jest.fn() }));
+    const Axios = require('axios');
+    Axios.get.mockImplementation(async (url) => {
+      if (String(url).includes('stooq.com')) return { data: 'Date,Open,High,Low,Close,Volume\n2026-01-08,100,100,100,100,1\n' };
+      throw new Error('provider unavailable');
+    });
+    require('../../config/alpacaConfig').getAlpacaConfig.mockRejectedValue(new Error('broker data unavailable'));
+    const { getCachedPrices } = require('../priceCacheService');
+    await expect(getCachedPrices({ symbol: 'BIL', startDate: '2026-01-08', endDate: '2026-01-08', adjustment: 'all', source: 'stooq' })).rejects.toThrow();
+    expect(Axios.get.mock.calls.some(c => String(c[0]).includes('stooq.com'))).toBe(false);
+  });
+
+  it('does not label Tiingo total-return prices as split-only prices', async () => {
+    jest.doMock('axios', () => ({ get: jest.fn(), create: jest.fn() }));
+    const Axios = require('axios');
+    Axios.get.mockImplementation(async (url) => {
+      if (String(url).includes('tiingo.com')) return { data: [{ date: '2026-01-08', close: 100, adjClose: 90 }] };
+      if (String(url).includes('stooq.com')) return { data: 'Date,Open,High,Low,Close,Volume\n2026-01-08,100,100,100,100,1\n' };
+      throw new Error('unexpected provider');
+    });
+    const { getCachedPrices } = require('../priceCacheService');
+    const result = await getCachedPrices({ symbol: 'BIL', startDate: '2026-01-08', endDate: '2026-01-08', adjustment: 'split', source: 'tiingo' });
+    expect(result.bars[0].c).toBe(100);
+    expect(Axios.get.mock.calls.some(c => String(c[0]).includes('tiingo.com'))).toBe(false);
+  });
 });

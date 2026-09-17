@@ -187,15 +187,17 @@ Notes:
 - It never prints full secrets to stdout (only status + lengths).
 
 ## Strategy Evaluation Parity (Composer/defsymphony)
-The server evaluates defsymphony strategies locally. To keep results aligned with Composer, the defaults are:
+The server evaluates defsymphony strategies locally. Its runtime defaults are:
 - RSI: Wilder (`COMPOSER_RSI_METHOD=wilder`)
-- Price adjustment: split (`COMPOSER_DATA_ADJUSTMENT=split`)
+- Price adjustment: splits and dividends (`COMPOSER_DATA_ADJUSTMENT=all`)
 - As-of mode: previous close (`COMPOSER_ASOF_MODE=previous-close`)
 - Price source: Yahoo with Tiingo fallback (`COMPOSER_PRICE_SOURCE=yahoo`)
 - Price refresh: disabled by default (`COMPOSER_PRICE_REFRESH=false`) to avoid unexpected allocation changes
-- Indicators are computed using the prior bar when `previous-close` is used (lookahead-safe, closer to Composer backtests)
+- Indicators use the previous completed session with `previous-close`. This deliberately differs from Composer's intraday live signals.
 
-If you override these settings (ex: `RSI_METHOD=simple` or `PRICE_DATA_SOURCE=alpaca`), the app will still work but allocations can differ from Composer; rebalance logs will include a warning.
+Environment overrides can change these defaults; inspect the convention recorded in each rebalance log. Fallback providers and cached histories must support the requested adjustment: Tiingo is excluded for split-only/dividend-only requests, and Stooq is excluded for dividend-adjusted requests. Missing compatible data stops evaluation.
+
+Live rebalancing honors `:rebalance-threshold` as a percentage-point weight corridor using strategy-owned holdings and assigned cash. The configured budget cap and liquidation requests take precedence. Excess cash remains outside the invested budget; this is not a fully reinvested Composer simulation.
 
 ### Debug endpoints
 These endpoints are helpful when investigating mismatched holdings vs expected allocation:
