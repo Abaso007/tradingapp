@@ -7,6 +7,8 @@
 - `BIND_HOST=127.0.0.1` (default): serve through nginx; do not expose port 3000.
 - `REBALANCE_SCHEDULER_ENABLED=false`: maintenance switch for the portfolio scheduler. Remove or set true after reconciliation and deployment checks.
 - Preserve `COMPOSER_ASOF_MODE=previous-close`, current budget/cash limit and window. This change does **not** claim intraday Composer parity or change the strategy's signal policy.
+- Honor the definition's `:rebalance-threshold` (BB-XM: 0.069) using percentage-point differences between target weights and strategy holdings plus assigned cash. Within the corridor, retain holdings. Exceeding the invested budget or closing the strategy takes precedence, including sales smaller than the old 0.01-share tolerance. Changes from a 100% ETF target to another exceed the corridor. See [Composer's threshold definition](https://help.composer.trade/article/76-threshold-trading).
+- Price history fallbacks and caches must support the requested convention. Tiingo's `adjClose` includes both splits and dividends, so split-only/dividend-only requests use other providers. Stooq is never used for dividend-adjusted requests. Missing compatible data stops evaluation. See [Tiingo EOD documentation](https://www.tiingo.com/documentation/end-of-day).
 
 ## Execution and recovery
 
@@ -36,4 +38,8 @@ CI runs backend regression tests and builds the client before deploying. Both de
 
 ## Dependencies
 
-The unused client Alpaca SDK and the old server SDK were removed. The server uses its existing Axios REST path plus a small legacy read adapter; this avoids migrating to the incompatible SDK 4 API. Compatible dependency patches and a patched `ws` 8 override remove the server's high/critical findings. Remaining low/moderate Ethers/cron issues and frontend build/router dependencies need separate upgrades, rather than `npm audit fix --force` (which proposes invalid or breaking React tooling replacements).
+The unused client Alpaca SDK and the old server SDK were removed. The server uses its existing Axios REST path plus a small legacy read adapter; this avoids migrating to the incompatible SDK 4 API. Compatible dependency patches and a patched `ws` 8 override remove the server's high/critical findings.
+
+Client overrides use the existing SVGR 7 loader throughout React Scripts, resolve-url-loader 5/PostCSS 8, patched serialize-javascript, Underscore and once. The production build validates compatibility. As of September 17, `npm audit` reports no high/critical findings in either tree; the client has six moderate entries and the server has fourteen low/two moderate entries (counts include transitive propagation).
+
+Remaining frontend entries concern React Router and the local webpack development server. Production serves the static build through nginx, with no webpack dev server or server-side React hydration. Routes use application-owned paths; do not add untrusted navigation destinations before upgrading the router. The patched router requires React 18, while this client uses React 17. Treat React/router and React Scripts replacement as a coordinated migration with browser regression coverage; `npm audit fix --force` currently proposes react-scripts 0.0.0 and must not be used. Ethers/cron major upgrades are also outstanding. These residual advisories are documented, not declared fixed.

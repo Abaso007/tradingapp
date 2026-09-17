@@ -242,6 +242,9 @@ const fetchBarsFromTiingo = async ({ symbol, start, end, adjustment }) => {
 
   const resolvedAdjustment = normalizeAdjustment(adjustment);
   const useAdjusted = resolvedAdjustment !== 'raw';
+  if (resolvedAdjustment === 'split' || resolvedAdjustment === 'dividend') {
+    throw new Error('Tiingo adjClose combines splits and dividends; use another provider for separate adjustments.');
+  }
 
   const startIndex = (() => {
     if (tokens.length <= 1) {
@@ -295,7 +298,6 @@ const fetchBarsFromTiingo = async ({ symbol, start, end, adjustment }) => {
           const open = Number(row?.open);
           const high = Number(row?.high);
           const low = Number(row?.low);
-          const splitFactor = Number(row?.splitFactor);
           const volume = Number(row?.volume ?? row?.adjVolume ?? 0);
           const timestamp = row?.date;
           const date = timestamp ? new Date(timestamp) : null;
@@ -308,15 +310,11 @@ const fetchBarsFromTiingo = async ({ symbol, start, end, adjustment }) => {
             return null;
           }
 
-          // Prefer Tiingo-provided adjClose for split adjustment; if missing, invert splitFactor.
+          // Tiingo adjClose includes both splits and dividends. Never relabel it
+          // as split-only or silently replace a missing adjusted close with raw.
           let ratio = 1;
-          if (resolvedAdjustment === 'split') {
-            if (Number.isFinite(adjClose) && adjClose > 0) {
-              ratio = adjClose / close;
-            } else if (Number.isFinite(splitFactor) && splitFactor > 0) {
-              ratio = 1 / splitFactor;
-            }
-          } else if (useAdjusted && Number.isFinite(adjClose) && adjClose > 0) {
+          if (useAdjusted) {
+            if (!Number.isFinite(adjClose) || adjClose <= 0) throw new Error('Tiingo adjusted close is missing');
             ratio = adjClose / close;
           }
 
@@ -857,7 +855,7 @@ const fetchBarsFromTestfolio = async ({ symbol, start, end }) => {
   return [];
 };
 
-const getProviderAttemptOrder = ({ source, adjustment }) => {
+const getPreferredProviderOrder = ({ source, adjustment }) => {
   const normalizedSource = String(source ?? '').trim().toLowerCase();
   const normalizedAdjustment = normalizeAdjustment(adjustment);
   const wantsDividendAdjustment =
@@ -887,8 +885,7 @@ const getProviderAttemptOrder = ({ source, adjustment }) => {
       : ['alpaca', 'tiingo', 'stooq', 'yahoo'];
   }
   if (preferred === 'stooq') {
-    // Stooq daily history does not include dividend adjustments; prefer providers that can honor
-    // `adjustment=all|dividend` and only fall back to Stooq if nothing else is available.
+    // Dividend requests prefer providers with adjusted histories.
     return wantsDividendAdjustment
       ? ['tiingo', 'yahoo', 'alpaca', 'stooq']
       : ['stooq', 'tiingo', 'yahoo', 'alpaca'];
@@ -896,6 +893,15 @@ const getProviderAttemptOrder = ({ source, adjustment }) => {
   return wantsDividendAdjustment
     ? ['tiingo', 'yahoo', 'alpaca', 'stooq']
     : ['tiingo', 'stooq', 'yahoo', 'alpaca'];
+};
+
+const getProviderAttemptOrder = (options) => {
+  const adjustment = normalizeAdjustment(options.adjustment);
+  return getPreferredProviderOrder(options).filter((provider) => {
+    if (provider === 'stooq' && ['all', 'dividend'].includes(adjustment)) return false;
+    if (provider === 'tiingo' && ['split', 'dividend'].includes(adjustment)) return false;
+    return true;
+  });
 };
 
 const fetchBarsWithFallback = async ({ symbol, start, end, adjustment, source, minBars }) => {
@@ -1113,15 +1119,10 @@ const getCachedPrices = async ({
   }
 
   if (!cache) {
-    const anyCachesQuery = wantsDividendAdjustment
-      ? {
-          ...cacheQueryBase,
-          dataSource: { $in: cacheProviderOrder },
-        }
-      : {
-          ...cacheQueryBase,
-          dataSource: { $ne: 'testfolio' },
-        };
+    const anyCachesQuery = {
+      ...cacheQueryBase,
+      dataSource: { $in: cacheProviderOrder },
+    };
     const anyCaches = await PriceCache.find(anyCachesQuery);
     cache = pickNewest(anyCaches);
     subset = cache ? subsetBars(cache.bars || []) : [];

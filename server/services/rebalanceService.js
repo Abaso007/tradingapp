@@ -1,4 +1,5 @@
 const { syncLedger } = require('./alpacaLedger');
+const { getRebalanceThreshold, applyRebalanceCorridor } = require('./rebalanceCorridor');
 const { withBrokerAccountLock } = require('./brokerAccountLock');
 const { beginJournal, executeOrder, recoverJournal, brokerError, headersFor } = require('./alpacaOrderJournal');
 const Portfolio = require('../models/portfolioModel');
@@ -1803,6 +1804,15 @@ const rebalancePortfolioInternal = async (portfolio, assertOwned) => {
     maxSnapshotDriftPct,
   });
 
+  const rebalancePolicy = applyRebalanceCorridor({
+    adjustments,
+    threshold: portfolio.lifecycle === 'closing' ? null : getRebalanceThreshold(strategy?.strategy),
+    cash: strategyCash,
+    budget,
+    closing: portfolio.lifecycle === 'closing',
+  });
+  baseThoughtProcess.rebalancePolicy = rebalancePolicy;
+
   const sells = [];
   const buys = [];
   const executedSells = [];
@@ -1810,7 +1820,7 @@ const rebalancePortfolioInternal = async (portfolio, assertOwned) => {
 
   adjustments.forEach((adjustment) => {
     const qtyDiff = adjustment.desiredQty - adjustment.currentQty;
-    if (qtyDiff < 0 && (Math.abs(qtyDiff) > TOLERANCE || portfolio.lifecycle === 'closing')) {
+    if (qtyDiff < 0 && (Math.abs(qtyDiff) > TOLERANCE || adjustment.desiredQty === 0 || rebalancePolicy.aboveCap || portfolio.lifecycle === 'closing')) {
       const qtyToSell = Math.min(adjustment.currentQty, Math.abs(qtyDiff));
       if (qtyToSell > 0) {
         sells.push({
@@ -1964,17 +1974,14 @@ const rebalancePortfolioInternal = async (portfolio, assertOwned) => {
   portfolio.lastPerformanceComputedAt = now;
 
   const decisionTrace = adjustments.map((adjustment) => {
-    const qtyDiff = adjustment.desiredQty - adjustment.currentQty;
-    const action = Math.abs(qtyDiff) <= TOLERANCE
-      ? 'hold'
-      : qtyDiff > 0
-        ? 'buy'
-        : 'sell';
+    const action = sells.some(order => order.symbol === adjustment.symbol) ? 'sell'
+      : buys.some(order => order.symbol === adjustment.symbol) ? 'buy' : 'hold';
     const pct = Number.isFinite(adjustment.targetWeight)
       ? Math.round(adjustment.targetWeight * 10000) / 100
       : null;
     const explanation = (() => {
       if (action === 'hold') {
+        if (rebalancePolicy.hold) return `Holding position; weight drift remains within the ${rebalancePolicy.threshold * 100}% corridor.`;
         return 'Holding position; allocation already within tolerance of target weight.';
       }
       const direction = action === 'buy' ? 'increase' : 'reduce';
