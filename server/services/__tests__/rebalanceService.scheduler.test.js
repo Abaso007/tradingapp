@@ -80,7 +80,7 @@ describe('runDueRebalances scheduler concurrency', () => {
       { _id: 'portfolio-3', provider: 'polymarket', strategy_id: 'strategy-3', userId: 'user-1', name: 'Three' },
     ]);
 
-    const runPromise = runDueRebalances('polymarket');
+    const runPromise = runDueRebalances('polymarket', 'paper');
     await new Promise((resolve) => setImmediate(resolve));
 
     expect(syncPolymarketPortfolio).toHaveBeenCalledTimes(2);
@@ -107,11 +107,28 @@ it('keeps the Alpaca provider queue available during a long Polymarket sync', as
   syncPolymarketPortfolio.mockImplementation(() => new Promise((resolve) => { release = resolve; }));
   Portfolio.find.mockImplementation((query) => query.provider === 'polymarket'
     ? [{ _id: 'long', provider: 'polymarket', strategy_id: 'long', userId: 'u' }] : []);
-  const slow = runDueRebalances('polymarket');
+  const slow = runDueRebalances('polymarket', 'paper');
   await new Promise((resolve) => setImmediate(resolve));
   const fast = await runDueRebalances('alpaca');
   expect(fast.skipped).not.toBe(true);
   expect(fast.due).toBe(0);
+  release({ ok: true });
+  await slow;
+});
+
+it('processes live Polymarket while simulations are waiting without overlapping a portfolio', async () => {
+  resetRebalanceLock();
+  jest.clearAllMocks();
+  let release;
+  Portfolio.find.mockImplementation(query => [{ _id: query['polymarket.executionMode']?.$in ? 'live' : 'paper', provider: 'polymarket', userId: 'u' }]);
+  syncPolymarketPortfolio.mockImplementation(p => p._id === 'paper'
+    ? new Promise(resolve => { release = resolve; }) : Promise.resolve({ ok: true }));
+  const slow = runDueRebalances('polymarket', 'paper');
+  await new Promise(resolve => setImmediate(resolve));
+  const live = await runDueRebalances('polymarket', 'live');
+  expect(live.processed).toBe(1);
+  expect((await runDueRebalances('polymarket', 'paper')).reason).toBe('lock_in_progress');
+  expect(syncPolymarketPortfolio.mock.calls.filter(([p]) => p._id === 'paper')).toHaveLength(1);
   release({ ok: true });
   await slow;
 });

@@ -12,11 +12,15 @@
 
 ## Execution and recovery
 
-Alpaca and Polymarket have separate scheduler queues. Each Alpaca operation also holds a renewable Mongo lease keyed by broker credentials. An expired lease can be reclaimed after five minutes; an operation must confirm ownership before persisting or submitting. Never manually clear a lease while its worker is running.
+Alpaca, live Polymarket and paper Polymarket have separate scheduler queues. A large simulation cannot occupy the live Polymarket queue. All synchronizations remain enabled. Polymarket scheduler reads use plain Mongo records instead of hydrating thousands of Mongoose subdocuments; persistence still uses its existing explicit updates. A newly fetched maker-positions snapshot supplies fresh sizing prices; only missing fields need per-market refresh. This avoids re-fetching thousands of prices because the previous stored snapshot was old.
+
+Each Alpaca operation also holds a renewable Mongo lease keyed by broker credentials. An expired lease can be reclaimed after five minutes; an operation must confirm ownership before persisting or submitting. Never manually clear a lease while its worker is running.
 
 The portfolio stores a durable cycle baseline and order intents before submission. Broker UUIDs and client IDs are separate. Only confirmed cumulative `filled_qty` and `filled_avg_price` affect holdings, cash and realized P&L. Recovery replays the baseline and searches unknown orders by client ID. It never blindly resubmits an ambiguous POST. An unresolved 404 requires investigation; automatic retries are limited and pause new trading after three failures, while pending-order reconciliation continues.
 
 Sells must be confirmed before purchases; purchases use refreshed broker cash/buying power, strategy allocation and a reserve of 0.5% (minimum $0.05). This reserve reduces, but cannot guarantee, market-order execution costs. Account open orders, inconsistent positions, unknown market clock and stale live sizing prices block submissions. The live evaluator refuses an incomplete indicator universe. A personal holding in a new target symbol also blocks trading rather than being adopted. Multiple portfolios sharing a symbol require explicit allocation support before being used.
+
+Live sizing prefers a two-sided Alpaca quote with positive sizes, a valid bid/ask and a timestamp no older than five minutes. The ask conservatively sizes purchases. A fresh trade is the fallback if no valid quote is available; stale data still stops execution. The selected feed, timestamp and price source are recorded in the cycle log. A thinly traded IEX symbol can have fresh quotes even when its latest transaction is old; this does not change previous-close strategy signals. See [Alpaca latest quotes](https://docs.alpaca.markets/us/reference/stocklatestquotes-1).
 
 Creation is queued before orders are sent. Closure retains the portfolio and definition, liquidates only its tracked stocks through the journal and archives after confirmation. Pause/resume is available in the dashboard. Legacy AI-fund trading is paper-only; live strategy operations use the journaled path.
 
