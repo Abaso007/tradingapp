@@ -135,3 +135,27 @@ it('liquidates a small old target when changing ETF despite its fractional size'
   expect(client.post.mock.calls[0][1]).toMatchObject({ symbol: 'SPXU', qty: '0.005000' });
   expect(p.stocks.map(s => s.symbol)).toEqual(['SOXL']);
 });
+
+it('can rotate live targets using fresh quotes even without recent IEX trades', async () => {
+  const previousMode = process.env.ALPACA_EXECUTION_MODE;
+  process.env.ALPACA_EXECUTION_MODE = 'live';
+  try {
+    const { p, client } = fixture({ cash: 0, stocks: [{ symbol: 'SOXL', quantity: 1, avgCost: 90 }],
+      positions: [{ symbol: 'SOXL', qty: 1, current_price: 100 }] });
+    p.alpaca = { executionMode: 'live' };
+    p.targetPositions = [{ symbol: 'SPXU', targetWeight: 1 }];
+    const originalGet = client.get.getMockImplementation();
+    client.get.mockImplementation(async (url, options) => {
+      if (url.includes('quotes/latest')) return { data: { quotes: Object.fromEntries(['SOXL', 'SPXU'].map(symbol => [symbol,
+        { bp: 99.99, ap: 100, bs: 10, as: 10, t: new Date().toISOString() }])) } };
+      if (url.includes('/SPXU/trades/latest')) return { data: { trade: { p: 100, t: '2020-01-01T00:00:00Z' } } };
+      return originalGet(url, options);
+    });
+    await rebalancePortfolio(p);
+    expect(client.post.mock.calls.map(c => [c[1].symbol, c[1].side])).toEqual([['SOXL', 'sell'], ['SPXU', 'buy']]);
+    expect(p.executionState).toBe('completed');
+  } finally {
+    if (previousMode === undefined) delete process.env.ALPACA_EXECUTION_MODE;
+    else process.env.ALPACA_EXECUTION_MODE = previousMode;
+  }
+});

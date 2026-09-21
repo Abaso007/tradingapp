@@ -3282,6 +3282,7 @@ const syncPolymarketPortfolioInternal = async (portfolio, options = {}) => {
   let tradeScale = null;
   let seededFromPositionsSnapshot = false;
   let refreshedMakerStateFromPositionsSnapshot = false;
+  let makerPricesRefreshedAt = null;
   let forceScaleResetFromPositionsSnapshot = false;
   const selectMakerValueForSizing = ({ makerCashValue, makerHoldingsValue }) => {
     const holdingsValue = Math.max(0, toNumber(makerHoldingsValue, 0));
@@ -3363,6 +3364,7 @@ const syncPolymarketPortfolioInternal = async (portfolio, options = {}) => {
 
         makerCash = Math.max(0, toNumber(snapshot?.makerCash, 0));
         if (shouldAdoptSnapshotPositions) {
+          makerPricesRefreshedAt = new Date().toISOString();
           makerHoldingsByAssetId.clear();
           positions.forEach((pos) => {
             const assetId = pos?.asset_id ? String(pos.asset_id) : null;
@@ -4082,6 +4084,7 @@ const syncPolymarketPortfolioInternal = async (portfolio, options = {}) => {
             });
           });
           makerStateAvailable = true;
+          makerPricesRefreshedAt = new Date().toISOString();
           refreshedMakerStateFromPositionsSnapshot = hadStoredMakerState || refreshedMakerStateFromPositionsSnapshot;
           forceScaleResetFromPositionsSnapshot = sizeToBudgetBasis === 'positions';
 
@@ -4135,8 +4138,11 @@ const syncPolymarketPortfolioInternal = async (portfolio, options = {}) => {
       poly?.sizingState && typeof poly.sizingState === 'object' ? poly.sizingState : {};
     const makerHoldings = Array.from(makerHoldingsByAssetId.values());
     const refreshEntries = selectMarketRefreshEntries(makerHoldings, {
-      lastUpdatedAt: existingSizingState?.lastUpdatedAt,
-      nowMs,
+      // The Data API snapshot just refreshed these prices. Using the old
+      // persisted timestamp would refetch thousands of markets unnecessarily.
+      // Missing price/outcome fields still require an individual market fetch.
+      lastUpdatedAt: makerPricesRefreshedAt || existingSizingState?.lastUpdatedAt,
+      nowMs: Date.now(),
     });
     applySizingRefreshedHoldingsCount = refreshEntries.length;
     if (refreshEntries.length) {

@@ -1,4 +1,5 @@
 const { syncLedger } = require('./alpacaLedger');
+const { fetchFreshSizingPrices } = require('./alpacaSizingPrices');
 const { getRebalanceThreshold, applyRebalanceCorridor } = require('./rebalanceCorridor');
 const { withBrokerAccountLock } = require('./brokerAccountLock');
 const { beginJournal, executeOrder, recoverJournal, brokerError, headersFor } = require('./alpacaOrderJournal');
@@ -1782,15 +1783,9 @@ const rebalancePortfolioInternal = async (portfolio, assertOwned) => {
   }
   if (actualExecutionMode === 'live') {
     const symbols = [...new Set([...normalizedTargets.map((t) => t.symbol), ...Object.keys(trackedHoldings)])];
-    for (const symbol of symbols) {
-      const { data } = await dataKeys.client.get(`${dataKeys.apiUrl}/v2/stocks/${symbol}/trades/latest`, { headers: headersFor(dataKeys) });
-      const timestamp = Date.parse(data?.trade?.t);
-      const age = Date.now() - timestamp;
-      if (!Number.isFinite(timestamp) || age < -60000 || age > 5 * 60 * 1000 || !(Number(data?.trade?.p) > 0)) {
-        throw new Error(`Fresh market data unavailable for ${symbol}; execution stopped`);
-      }
-      priceCache[symbol] = Number(data.trade.p);
-    }
+    const sizing = await fetchFreshSizingPrices(symbols, dataKeys);
+    Object.assign(priceCache, sizing.prices);
+    baseThoughtProcess.sizingPrices = sizing.observations;
   }
 
   const adjustments = await buildAdjustments({
@@ -2231,9 +2226,13 @@ const withRebalanceLock = async (handler, provider = 'alpaca') => {
   }
 };
 
-const runDueRebalances = async (provider = null) => {
+const runDueRebalances = async (provider = null, polymarketMode = null) => {
   if (!provider) {
     const results = await Promise.all(['alpaca', 'polymarket'].map((p) => runDueRebalances(p)));
+    return { ok: true, due: results.reduce((n, r) => n + (r.due || 0), 0), processed: results.reduce((n, r) => n + (r.processed || 0), 0), results };
+  }
+  if (provider === 'polymarket' && !polymarketMode) {
+    const results = await Promise.all(['live', 'paper'].map(mode => runDueRebalances(provider, mode)));
     return { ok: true, due: results.reduce((n, r) => n + (r.due || 0), 0), processed: results.reduce((n, r) => n + (r.processed || 0), 0), results };
   }
   try {
@@ -2241,6 +2240,9 @@ const runDueRebalances = async (provider = null) => {
       const now = new Date();
       let duePortfoliosQuery = Portfolio.find({
         provider: provider === 'alpaca' ? { $ne: 'polymarket' } : 'polymarket',
+        ...(provider === 'polymarket' ? { 'polymarket.executionMode': polymarketMode === 'live'
+          ? { $in: [/^\s*(live|real|true|1|yes)\s*$/i] }
+          : { $nin: [/^\s*(live|real|true|1|yes)\s*$/i] } } : {}),
         $and: [{ $or: [{ lifecycle: { $nin: ['paused', 'closed'] } }, { 'executionJournal.committed': false }] }],
         recurrence: { $exists: true },
         $or: [
@@ -2251,6 +2253,11 @@ const runDueRebalances = async (provider = null) => {
       if (duePortfoliosQuery && !Array.isArray(duePortfoliosQuery) && typeof duePortfoliosQuery.sort === 'function') {
         duePortfoliosQuery = duePortfoliosQuery.sort({ nextRebalanceAt: 1, _id: 1 });
       }
+      // Polymarket persists explicit updates and does not need hydrated Mongoose
+      // documents for thousands of holdings. Alpaca needs document.save().
+      if (provider === 'polymarket' && typeof duePortfoliosQuery?.lean === 'function') {
+        duePortfoliosQuery = duePortfoliosQuery.lean();
+      }
       const duePortfolios = await duePortfoliosQuery;
 
       if (!Array.isArray(duePortfolios) || duePortfolios.length === 0) {
@@ -2260,7 +2267,7 @@ const runDueRebalances = async (provider = null) => {
       let processed = 0;
       let cursor = 0;
       const shouldLogPortfolioRuns = process.env.NODE_ENV !== 'test';
-      const workerCount = Math.max(1, Math.min(REBALANCE_MAX_CONCURRENCY, duePortfolios.length));
+      const workerCount = Math.max(1, Math.min(polymarketMode === 'live' ? 1 : REBALANCE_MAX_CONCURRENCY, duePortfolios.length));
       await Promise.all(
         Array.from({ length: workerCount }, async (_, workerIndex) => {
           while (true) {
@@ -2349,7 +2356,7 @@ const runDueRebalances = async (provider = null) => {
         processed,
         concurrency: workerCount,
       };
-    }, provider);
+    }, provider === 'polymarket' ? `polymarket:${polymarketMode}` : provider);
   } catch (error) {
     if (String(error?.message || '').includes('Rebalance already in progress')) {
       const nowMs = Date.now();
@@ -2382,7 +2389,9 @@ const rebalanceNow = async ({ strategyId, userId, mode = null }) => {
   }
 };
 
-const isRebalanceLocked = (provider = 'alpaca') => rebalanceLocks.has(provider);
+const isRebalanceLocked = (provider = 'alpaca') => provider === 'polymarket'
+  ? rebalanceLocks.has('polymarket:live') && rebalanceLocks.has('polymarket:paper')
+  : rebalanceLocks.has(provider);
 const resetRebalanceLock = () => { rebalanceLocks.clear(); };
 
 module.exports = {

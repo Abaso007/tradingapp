@@ -429,9 +429,10 @@ jest.mock('../strategyLogger', () => ({
     expect(portfolio.polymarket?.sizingState?.scaleBasis).toBe('positions');
   });
 
-  it('refreshes size-to-budget maker state from paginated open positions and drops stale holdings', async () => {
+  it.each([0, 24 * 60 * 60 * 1000])('reuses paginated position prices even when stored state is %i ms old', async (ageMs) => {
     const makerAddress = '0x3333333333333333333333333333333333333333';
-    const freshSizingStateAt = new Date().toISOString();
+    const freshSizingStateAt = new Date(Date.now() - ageMs).toISOString();
+    const redundantMarketFetch = nock('https://clob.polymarket.com').get(/\/markets\//).query(true).reply(200, { tokens: [] }).persist();
 
     process.env.POLYMARKET_TRADES_SOURCE = 'data-api';
     process.env.POLYMARKET_SIZE_TO_BUDGET_BASIS = 'positions';
@@ -551,6 +552,7 @@ jest.mock('../strategyLogger', () => ({
     const result = await syncPolymarketPortfolio(portfolio, { mode: 'incremental' });
     expect(result.mode).toBe('incremental');
     expect(dataApi.isDone()).toBe(true);
+    expect(redundantMarketFetch.isDone()).toBe(false);
     expect(portfolio.polymarket?.sizingState?.scaleMakerValue).toBeCloseTo(150, 6);
     expect(portfolio.polymarket?.sizingState?.scale).toBeCloseTo(100 / 150, 6);
     expect(portfolio.polymarket?.sizingState?.holdings).toHaveLength(101);
